@@ -1,0 +1,18 @@
+{
+  "auth_dir": "/path/to/auths",
+  "base_url": "https://chatgpt.com/backend-api/codex",
+  "quota_path": "/responses",
+  "model": "gpt-5",
+  "timeout": 20,
+  "max_retries": 3,
+  "refresh_before_check": false,
+  "refresh_url": "https://auth.openai.com/oauth/token",
+  "output_json": false,
+  "delete_401": false,
+  "assume_yes": false,
+  "proxy": {
+    "http": "",
+    "https": "",
+    "no_proxy": "localhost,127.0.0.1"
+  }
+}
