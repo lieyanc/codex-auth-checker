@@ -66,14 +66,41 @@ type Config struct {
 }
 
 type CheckResult struct {
-	File            string `json:"file"`
-	Provider        string `json:"provider"`
-	Email           string `json:"email"`
-	AccountID       string `json:"account_id"`
-	StatusCode      *int   `json:"status_code"`
-	Unauthorized401 bool   `json:"unauthorized_401"`
-	Error           string `json:"error"`
-	ResponsePreview string `json:"response_preview"`
+	File            string        `json:"file"`
+	Provider        string        `json:"provider"`
+	Email           string        `json:"email"`
+	AccountID       string        `json:"account_id"`
+	StatusCode      *int          `json:"status_code"`
+	Unauthorized401 bool          `json:"unauthorized_401"`
+	Error           string        `json:"error"`
+	ResponsePreview string        `json:"response_preview"`
+	Latency         time.Duration `json:"-"`
+}
+
+type ScanStats struct {
+	TotalFiles     int           `json:"total_files"`
+	CodexFiles     int           `json:"codex_files"`
+	Unauthorized   int           `json:"unauthorized_401"`
+	Errors         int           `json:"errors"`
+	TotalDuration  time.Duration `json:"-"`
+	ProbeDuration  time.Duration `json:"-"`
+	Concurrency    int           `json:"concurrency"`
+	Latencies      []time.Duration `json:"-"`
+}
+
+type jsonStats struct {
+	TotalFiles    int     `json:"total_files"`
+	CodexFiles    int     `json:"codex_files"`
+	Unauthorized  int     `json:"unauthorized_401"`
+	Errors        int     `json:"errors"`
+	Concurrency   int     `json:"concurrency"`
+	TotalDurationMs int64 `json:"total_duration_ms"`
+	ProbeDurationMs int64 `json:"probe_duration_ms"`
+	AvgLatencyMs  float64 `json:"avg_latency_ms"`
+	MinLatencyMs  float64 `json:"min_latency_ms"`
+	MaxLatencyMs  float64 `json:"max_latency_ms"`
+	MedianLatencyMs float64 `json:"median_latency_ms"`
+	P95LatencyMs  float64 `json:"p95_latency_ms"`
 }
 
 type DeleteError struct {
@@ -90,8 +117,21 @@ type CronSchedule struct {
 }
 
 type jsonOutput struct {
-	Results  []CheckResult `json:"results"`
-	Deletion jsonDeletion  `json:"deletion"`
+	Results  []jsonResult `json:"results"`
+	Stats    *jsonStats   `json:"stats,omitempty"`
+	Deletion jsonDeletion `json:"deletion"`
+}
+
+type jsonResult struct {
+	File            string  `json:"file"`
+	Provider        string  `json:"provider"`
+	Email           string  `json:"email"`
+	AccountID       string  `json:"account_id"`
+	StatusCode      *int    `json:"status_code"`
+	Unauthorized401 bool    `json:"unauthorized_401"`
+	Error           string  `json:"error"`
+	ResponsePreview string  `json:"response_preview"`
+	LatencyMs       float64 `json:"latency_ms,omitempty"`
 }
 
 type jsonDeletion struct {
@@ -480,6 +520,7 @@ func resultTagColor(r CheckResult, maxRetries int) (string, string) {
 }
 
 func probeOneFile(cfg *Config, client *http.Client, path string, fields map[string]string, onRetry retryCallback) CheckResult {
+	probeStart := time.Now()
 	accessToken := fields["access_token"]
 	refreshToken := fields["refresh_token"]
 
@@ -492,6 +533,7 @@ func probeOneFile(cfg *Config, client *http.Client, path string, fields map[stri
 				Email:     fields["email"],
 				AccountID: fields["account_id"],
 				Error:     err.Error(),
+				Latency:   time.Since(probeStart),
 			}
 		}
 		accessToken = newToken
@@ -504,6 +546,7 @@ func probeOneFile(cfg *Config, client *http.Client, path string, fields map[stri
 			Email:     fields["email"],
 			AccountID: fields["account_id"],
 			Error:     "missing access token",
+			Latency:   time.Since(probeStart),
 		}
 	}
 
@@ -535,6 +578,7 @@ func probeOneFile(cfg *Config, client *http.Client, path string, fields map[stri
 				StatusCode:      &sc,
 				Unauthorized401: status == 401,
 				ResponsePreview: preview,
+				Latency:         time.Since(probeStart),
 			}
 		}
 		lastErr = err
@@ -546,19 +590,27 @@ func probeOneFile(cfg *Config, client *http.Client, path string, fields map[stri
 		Email:     fields["email"],
 		AccountID: fields["account_id"],
 		Error:     fmt.Sprintf("network error: %v", lastErr),
+		Latency:   time.Since(probeStart),
 	}
 }
 
 // ── file scan main loop ──────────────────────────────────────────────────────
 
-func scanAuthFiles(ctx context.Context, cfg *Config, client *http.Client) ([]CheckResult, error) {
+func scanAuthFiles(ctx context.Context, cfg *Config, client *http.Client) ([]CheckResult, ScanStats, error) {
+	scanStart := time.Now()
+	var stats ScanStats
+	stats.Concurrency = cfg.Concurrency
+	if stats.Concurrency < 1 {
+		stats.Concurrency = 1
+	}
+
 	authDir, err := filepath.Abs(expandHome(cfg.AuthDir))
 	if err != nil {
-		return nil, fmt.Errorf("cannot resolve auth directory: %w", err)
+		return nil, stats, fmt.Errorf("cannot resolve auth directory: %w", err)
 	}
 	info, err := os.Stat(authDir)
 	if err != nil || !info.IsDir() {
-		return nil, fmt.Errorf("auth directory not found: %s", authDir)
+		return nil, stats, fmt.Errorf("auth directory not found: %s", authDir)
 	}
 
 	var jsonFiles []string
@@ -611,6 +663,8 @@ func scanAuthFiles(ctx context.Context, cfg *Config, client *http.Client) ([]Che
 		jobs = append(jobs, probeJob{slotIdx: i, path: path, fields: fields, label: label})
 	}
 
+	stats.TotalFiles = len(jsonFiles)
+
 	totalCodex := len(jobs)
 	if totalCodex == 0 {
 		var results []CheckResult
@@ -619,7 +673,8 @@ func scanAuthFiles(ctx context.Context, cfg *Config, client *http.Client) ([]Che
 				results = append(results, s.result)
 			}
 		}
-		return results, nil
+		stats.TotalDuration = time.Since(scanStart)
+		return results, stats, nil
 	}
 
 	concurrency := cfg.Concurrency
@@ -638,6 +693,7 @@ func scanAuthFiles(ctx context.Context, cfg *Config, client *http.Client) ([]Che
 	}
 
 	// Phase 2: probe codex files with worker pool
+	probeStart := time.Now()
 	var mu sync.Mutex
 	done := 0
 
@@ -686,6 +742,7 @@ func scanAuthFiles(ctx context.Context, cfg *Config, client *http.Client) ([]Che
 	}
 	close(jobsCh)
 	wg.Wait()
+	stats.ProbeDuration = time.Since(probeStart)
 
 	if ctx.Err() != nil {
 		mu.Lock()
@@ -698,12 +755,79 @@ func scanAuthFiles(ctx context.Context, cfg *Config, client *http.Client) ([]Che
 	for _, s := range slots {
 		if s.valid {
 			results = append(results, s.result)
+			if s.result.Latency > 0 {
+				stats.Latencies = append(stats.Latencies, s.result.Latency)
+			}
+			if s.result.Unauthorized401 {
+				stats.Unauthorized++
+			}
+			if s.result.Error != "" {
+				stats.Errors++
+			}
 		}
 	}
-	return results, nil
+	stats.CodexFiles = totalCodex
+	stats.TotalDuration = time.Since(scanStart)
+	return results, stats, nil
 }
 
 // ── output formatting ────────────────────────────────────────────────────────
+
+func (s ScanStats) computeJSON() jsonStats {
+	js := jsonStats{
+		TotalFiles:      s.TotalFiles,
+		CodexFiles:      s.CodexFiles,
+		Unauthorized:    s.Unauthorized,
+		Errors:          s.Errors,
+		Concurrency:     s.Concurrency,
+		TotalDurationMs: s.TotalDuration.Milliseconds(),
+		ProbeDurationMs: s.ProbeDuration.Milliseconds(),
+	}
+	if len(s.Latencies) == 0 {
+		return js
+	}
+	sorted := make([]time.Duration, len(s.Latencies))
+	copy(sorted, s.Latencies)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+
+	var total time.Duration
+	for _, d := range sorted {
+		total += d
+	}
+	js.AvgLatencyMs = float64(total.Microseconds()) / float64(len(sorted)) / 1000.0
+	js.MinLatencyMs = float64(sorted[0].Microseconds()) / 1000.0
+	js.MaxLatencyMs = float64(sorted[len(sorted)-1].Microseconds()) / 1000.0
+	js.MedianLatencyMs = float64(sorted[len(sorted)/2].Microseconds()) / 1000.0
+	p95Idx := int(float64(len(sorted)) * 0.95)
+	if p95Idx >= len(sorted) {
+		p95Idx = len(sorted) - 1
+	}
+	js.P95LatencyMs = float64(sorted[p95Idx].Microseconds()) / 1000.0
+	return js
+}
+
+func printStats(stats ScanStats) {
+	js := stats.computeJSON()
+	emit("")
+	emit(fmt.Sprintf("%s── Performance ──%s", cBold, cReset))
+	emit(fmt.Sprintf("  Total duration    %s%v%s", cCyan, stats.TotalDuration.Round(time.Millisecond), cReset))
+	emit(fmt.Sprintf("  Probe duration    %s%v%s", cCyan, stats.ProbeDuration.Round(time.Millisecond), cReset))
+	emit(fmt.Sprintf("  Files scanned     %d total, %s%d%s codex", stats.TotalFiles, cBold, stats.CodexFiles, cReset))
+	emit(fmt.Sprintf("  Concurrency       %d", stats.Concurrency))
+
+	if len(stats.Latencies) == 0 {
+		return
+	}
+	emit(fmt.Sprintf("  Avg latency       %s%.0f ms%s", cCyan, js.AvgLatencyMs, cReset))
+	emit(fmt.Sprintf("  Min latency       %.0f ms", js.MinLatencyMs))
+	emit(fmt.Sprintf("  Max latency       %.0f ms", js.MaxLatencyMs))
+	emit(fmt.Sprintf("  Median latency    %.0f ms", js.MedianLatencyMs))
+	emit(fmt.Sprintf("  P95 latency       %.0f ms", js.P95LatencyMs))
+	if stats.CodexFiles > 0 && stats.ProbeDuration > 0 {
+		throughput := float64(stats.CodexFiles) / stats.ProbeDuration.Seconds()
+		emit(fmt.Sprintf("  Throughput        %s%.1f req/s%s", cCyan, throughput, cReset))
+	}
+}
 
 func printTable(results []CheckResult) {
 	if len(results) == 0 {
@@ -754,7 +878,7 @@ func printTable(results []CheckResult) {
 	}
 }
 
-func outputJSON(results []CheckResult, requested bool, unauthorizedFiles []string,
+func outputJSON(results []CheckResult, stats ScanStats, requested bool, unauthorizedFiles []string,
 	confirmed bool, deletedFiles []string, deleteErrors []DeleteError, outputDir string) {
 	if deletedFiles == nil {
 		deletedFiles = []string{}
@@ -762,8 +886,26 @@ func outputJSON(results []CheckResult, requested bool, unauthorizedFiles []strin
 	if deleteErrors == nil {
 		deleteErrors = []DeleteError{}
 	}
+
+	jResults := make([]jsonResult, len(results))
+	for i, r := range results {
+		jResults[i] = jsonResult{
+			File:            r.File,
+			Provider:        r.Provider,
+			Email:           r.Email,
+			AccountID:       r.AccountID,
+			StatusCode:      r.StatusCode,
+			Unauthorized401: r.Unauthorized401,
+			Error:           r.Error,
+			ResponsePreview: r.ResponsePreview,
+			LatencyMs:       float64(r.Latency.Microseconds()) / 1000.0,
+		}
+	}
+
+	js := stats.computeJSON()
 	out := jsonOutput{
-		Results: results,
+		Results: jResults,
+		Stats:   &js,
 		Deletion: jsonDeletion{
 			Requested:    requested,
 			TargetCount:  len(unauthorizedFiles),
@@ -1150,7 +1292,7 @@ func (cs *CronSchedule) NextAfter(t time.Time) (time.Time, bool) {
 // ── scheduler ────────────────────────────────────────────────────────────────
 
 func runOneScan(ctx context.Context, cfg *Config, client *http.Client) int {
-	results, err := scanAuthFiles(ctx, cfg, client)
+	results, stats, err := scanAuthFiles(ctx, cfg, client)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 2
@@ -1175,10 +1317,11 @@ func runOneScan(ctx context.Context, cfg *Config, client *http.Client) int {
 	}
 
 	if cfg.OutputJSON {
-		outputJSON(results, cfg.Delete401, unauthorizedFiles, deleteConfirmed, deletedFiles, deleteErrors, cfg.OutputDir)
+		outputJSON(results, stats, cfg.Delete401, unauthorizedFiles, deleteConfirmed, deletedFiles, deleteErrors, cfg.OutputDir)
 	} else {
 		printTable(results)
 		printDeletionSummary(cfg.Delete401, len(unauthorizedFiles), deleteConfirmed, deletedFiles, deleteErrors, cfg.OutputDir)
+		printStats(stats)
 	}
 
 	sendWebhook(cfg, client, results, deletedFiles, deleteErrors)
