@@ -51,6 +51,7 @@ type Config struct {
 	RefreshBeforeCheck bool
 	RefreshURL         string
 	OutputJSON         bool
+	OutputDir          string
 	Delete401          bool
 	AssumeYes          bool
 	HTTPProxy          string
@@ -754,7 +755,7 @@ func printTable(results []CheckResult) {
 }
 
 func outputJSON(results []CheckResult, requested bool, unauthorizedFiles []string,
-	confirmed bool, deletedFiles []string, deleteErrors []DeleteError) {
+	confirmed bool, deletedFiles []string, deleteErrors []DeleteError, outputDir string) {
 	if deletedFiles == nil {
 		deletedFiles = []string{}
 	}
@@ -777,7 +778,27 @@ func outputJSON(results []CheckResult, requested bool, unauthorizedFiles []strin
 	enc.SetEscapeHTML(false)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(out)
-	fmt.Print(buf.String())
+
+	if outputDir == "" {
+		fmt.Print(buf.String())
+		return
+	}
+
+	dateDir := filepath.Join(outputDir, time.Now().Format("2006-01-02"))
+	if err := os.MkdirAll(dateDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "%sWarning:%s cannot create output directory %s: %v, printing to stdout\n",
+			cYellow, cReset, dateDir, err)
+		fmt.Print(buf.String())
+		return
+	}
+	outPath := filepath.Join(dateDir, "scan_results.json")
+	if err := os.WriteFile(outPath, buf.Bytes(), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "%sWarning:%s cannot write %s: %v, printing to stdout\n",
+			cYellow, cReset, outPath, err)
+		fmt.Print(buf.String())
+		return
+	}
+	emit(fmt.Sprintf("%sResults saved to%s %s", cGreen, cReset, outPath))
 }
 
 // ── file deletion ────────────────────────────────────────────────────────────
@@ -804,10 +825,21 @@ func confirmDeletion(targets []string, assumeYes bool) bool {
 	return answer == "y" || answer == "yes"
 }
 
-func deleteFiles(paths []string) ([]string, []DeleteError) {
+func deleteFiles(paths []string, outputDir string) ([]string, []DeleteError) {
 	var deleted []string
 	var errors []DeleteError
 	seen := map[string]bool{}
+
+	// determine target directory for archiving deleted files
+	var archiveDir string
+	if outputDir != "" {
+		archiveDir = filepath.Join(outputDir, time.Now().Format("2006-01-02"), "deleted")
+		if err := os.MkdirAll(archiveDir, 0o755); err != nil {
+			emit(fmt.Sprintf("%sWarning:%s cannot create archive directory %s: %v, falling back to permanent deletion",
+				cYellow, cReset, archiveDir, err))
+			archiveDir = ""
+		}
+	}
 
 	for _, rawPath := range paths {
 		absPath, err := filepath.Abs(rawPath)
@@ -819,16 +851,62 @@ func deleteFiles(paths []string) ([]string, []DeleteError) {
 		}
 		seen[absPath] = true
 
-		if err := os.Remove(rawPath); err != nil {
-			errors = append(errors, DeleteError{File: rawPath, Error: err.Error()})
-		} else {
+		if archiveDir != "" {
+			// move file to archive directory
+			destPath := filepath.Join(archiveDir, filepath.Base(rawPath))
+			// avoid overwriting: append counter if duplicate name
+			if _, statErr := os.Stat(destPath); statErr == nil {
+				ext := filepath.Ext(destPath)
+				base := strings.TrimSuffix(destPath, ext)
+				for i := 1; ; i++ {
+					candidate := fmt.Sprintf("%s_%d%s", base, i, ext)
+					if _, statErr := os.Stat(candidate); statErr != nil {
+						destPath = candidate
+						break
+					}
+				}
+			}
+			if err := os.Rename(rawPath, destPath); err != nil {
+				// rename failed (cross-device?), try copy+remove
+				if copyErr := copyFile(rawPath, destPath); copyErr != nil {
+					errors = append(errors, DeleteError{File: rawPath, Error: copyErr.Error()})
+					continue
+				}
+				if rmErr := os.Remove(rawPath); rmErr != nil {
+					errors = append(errors, DeleteError{File: rawPath, Error: fmt.Sprintf("archived but remove failed: %v", rmErr)})
+					continue
+				}
+			}
 			deleted = append(deleted, rawPath)
+		} else {
+			if err := os.Remove(rawPath); err != nil {
+				errors = append(errors, DeleteError{File: rawPath, Error: err.Error()})
+			} else {
+				deleted = append(deleted, rawPath)
+			}
 		}
 	}
 	return deleted, errors
 }
 
-func printDeletionSummary(requested bool, targetCount int, confirmed bool, deletedFiles []string, errors []DeleteError) {
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Close()
+}
+
+func printDeletionSummary(requested bool, targetCount int, confirmed bool, deletedFiles []string, errors []DeleteError, outputDir string) {
 	if !requested {
 		return
 	}
@@ -842,7 +920,12 @@ func printDeletionSummary(requested bool, targetCount int, confirmed bool, delet
 		fmt.Println("Deletion cancelled by user.")
 		return
 	}
-	fmt.Printf("Deletion completed: %d/%d removed.\n", len(deletedFiles), targetCount)
+	if outputDir != "" {
+		archiveDir := filepath.Join(outputDir, time.Now().Format("2006-01-02"), "deleted")
+		fmt.Printf("Deletion completed: %d/%d archived to %s\n", len(deletedFiles), targetCount, archiveDir)
+	} else {
+		fmt.Printf("Deletion completed: %d/%d removed.\n", len(deletedFiles), targetCount)
+	}
 	for _, p := range deletedFiles {
 		fmt.Printf("[deleted] %s\n", p)
 	}
@@ -1087,15 +1170,15 @@ func runOneScan(ctx context.Context, cfg *Config, client *http.Client) int {
 	if cfg.Delete401 && len(unauthorizedFiles) > 0 {
 		deleteConfirmed = confirmDeletion(unauthorizedFiles, cfg.AssumeYes)
 		if deleteConfirmed {
-			deletedFiles, deleteErrors = deleteFiles(unauthorizedFiles)
+			deletedFiles, deleteErrors = deleteFiles(unauthorizedFiles, cfg.OutputDir)
 		}
 	}
 
 	if cfg.OutputJSON {
-		outputJSON(results, cfg.Delete401, unauthorizedFiles, deleteConfirmed, deletedFiles, deleteErrors)
+		outputJSON(results, cfg.Delete401, unauthorizedFiles, deleteConfirmed, deletedFiles, deleteErrors, cfg.OutputDir)
 	} else {
 		printTable(results)
-		printDeletionSummary(cfg.Delete401, len(unauthorizedFiles), deleteConfirmed, deletedFiles, deleteErrors)
+		printDeletionSummary(cfg.Delete401, len(unauthorizedFiles), deleteConfirmed, deletedFiles, deleteErrors, cfg.OutputDir)
 	}
 
 	sendWebhook(cfg, client, results, deletedFiles, deleteErrors)
@@ -1461,6 +1544,8 @@ func run() int {
 		"Token refresh endpoint (fallback default: "+defaultRefreshURL+")")
 	outputJSONFlag := flag.Bool("output-json", false,
 		"Print full results as JSON instead of table view.")
+	outputDir := flag.String("output-dir", "",
+		"Directory for saving results and archived deleted files (default: ./results).")
 	delete401 := flag.Bool("delete-401", false,
 		"Delete auth files that returned HTTP 401 after confirmation.")
 	assumeYes := flag.Bool("assume-yes", false,
@@ -1589,6 +1674,8 @@ func run() int {
 		fmt.Fprintf(os.Stderr, "Error: output_json must be a boolean value\n")
 		return 2
 	}
+	cfg.OutputDir = resolveStr(*outputDir, cliSet["output-dir"], fc, "output_dir", "./results")
+	cfg.OutputDir = expandHome(cfg.OutputDir)
 	cfg.Delete401, err = resolveBool(*delete401, cliSet["delete-401"], fc, "delete_401", false)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: delete_401 must be a boolean value\n")

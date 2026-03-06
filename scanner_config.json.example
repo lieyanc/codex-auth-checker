@@ -8,6 +8,7 @@
   "refresh_before_check": false,
   "refresh_url": "https://auth.openai.com/oauth/token",
   "output_json": false,
+  "output_dir": "./results",
   "delete_401": false,
   "assume_yes": false,
   "proxy": {
