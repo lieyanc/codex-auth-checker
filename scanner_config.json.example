@@ -14,5 +14,10 @@
     "http": "",
     "https": "",
     "no_proxy": "localhost,127.0.0.1"
-  }
+  },
+  "interval": "",
+  "cron": "",
+  "concurrency": 1,
+  "webhook_url": "",
+  "webhook_headers": ""
 }

@@ -1,0 +1,98 @@
+name: Build & Pre-Release
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Generate version
+        id: version
+        run: |
+          COMMIT_COUNT=$(git rev-list --count HEAD)
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          DATE=$(date -u +%Y%m%d)
+          VERSION="dev-$(printf '%04d' $COMMIT_COUNT)-${DATE}-${SHORT_SHA}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Cross compile
+        run: |
+          BINARY=codex-scanner
+          declare -a TARGETS=(
+            "linux/amd64"
+            "linux/arm64"
+            "darwin/amd64"
+            "darwin/arm64"
+            "windows/amd64"
+            "windows/arm64"
+          )
+          mkdir -p dist
+          for target in "${TARGETS[@]}"; do
+            GOOS="${target%/*}"
+            GOARCH="${target#*/}"
+            output="dist/${BINARY}-${GOOS}-${GOARCH}"
+            if [ "$GOOS" = "windows" ]; then
+              output="${output}.exe"
+            fi
+            echo "::group::Building ${GOOS}/${GOARCH}"
+            CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" go build -ldflags="-s -w" -trimpath -o "$output" .
+            echo "::endgroup::"
+          done
+          ls -lh dist/
+
+      - name: Delete previous dev pre-releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release list --json tagName,isPrerelease \
+            -q '.[] | select(.isPrerelease) | select(.tagName | startswith("dev-")) | .tagName' \
+          | while read -r tag; do
+            echo "Deleting release ${tag}..."
+            gh release delete "$tag" --yes --cleanup-tag
+          done
+
+      - name: Create pre-release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          COMMIT_MSG=$(git log -1 --pretty=format:'%s')
+          FULL_SHA=$(git rev-parse HEAD)
+          DATE=$(date -u +%Y-%m-%d)
+
+          gh release create "$VERSION" dist/* \
+            --prerelease \
+            --title "Pre-release ${VERSION}" \
+            --notes "$(cat <<EOF
+          Automated pre-release build
+
+          |  |  |
+          |--|--|
+          | **Commit** | \`${FULL_SHA}\` |
+          | **Message** | ${COMMIT_MSG} |
+          | **Date** | ${DATE} |
+
+          ### Downloads
+          | Platform | Architecture | File |
+          |----------|-------------|------|
+          | Linux | amd64 | \`codex-scanner-linux-amd64\` |
+          | Linux | arm64 | \`codex-scanner-linux-arm64\` |
+          | macOS | amd64 (Intel) | \`codex-scanner-darwin-amd64\` |
+          | macOS | arm64 (Apple Silicon) | \`codex-scanner-darwin-arm64\` |
+          | Windows | amd64 | \`codex-scanner-windows-amd64.exe\` |
+          | Windows | arm64 | \`codex-scanner-windows-arm64.exe\` |
+          EOF
+          )"
