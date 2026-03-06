@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,7 +32,12 @@ const (
 	defaultVersion      = "0.98.0"
 	defaultUserAgent    = "codex_cli_rs/0.98.0 (python-port)"
 	defaultConfigPath   = "scanner_config.json"
+	repoOwner           = "lieyanc"
+	repoName            = "codex-auth-checker"
+	binaryBaseName      = "codex-scanner"
 )
+
+var buildVersion = "dev"
 
 // ── types ────────────────────────────────────────────────────────────────────
 
@@ -1265,6 +1271,172 @@ func extractProxyFromConfig(fc map[string]interface{}) (httpProxy, httpsProxy, n
 	return
 }
 
+// ── self-update (OTA) ────────────────────────────────────────────────────────
+
+type ghRelease struct {
+	TagName string  `json:"tag_name"`
+	Assets  []ghAsset `json:"assets"`
+}
+
+type ghAsset struct {
+	Name               string `json:"name"`
+	BrowserDownloadURL string `json:"browser_download_url"`
+}
+
+func selfUpdate(httpProxy, httpsProxy, noProxy string) {
+	if buildVersion == "dev" {
+		fmt.Fprintf(os.Stderr, "%s[update]%s skipped (dev build)\n", cDim, cReset)
+		return
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s[update]%s cannot determine executable: %v\n", cYellow, cReset, err)
+		return
+	}
+	exe, err = filepath.EvalSymlinks(exe)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s[update]%s cannot resolve path: %v\n", cYellow, cReset, err)
+		return
+	}
+
+	// set proxy env so http.ProxyFromEnvironment picks them up
+	if httpProxy != "" {
+		os.Setenv("HTTP_PROXY", httpProxy)
+	}
+	if httpsProxy != "" {
+		os.Setenv("HTTPS_PROXY", httpsProxy)
+	}
+	if noProxy != "" {
+		os.Setenv("NO_PROXY", noProxy)
+		os.Setenv("no_proxy", noProxy)
+	}
+
+	client := &http.Client{
+		Timeout:   15 * time.Second,
+		Transport: &http.Transport{Proxy: http.ProxyFromEnvironment},
+	}
+
+	// query latest release (pre-release included)
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases?per_page=1", repoOwner, repoName)
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s[update]%s %v\n", cYellow, cReset, err)
+		return
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s[update]%s check failed: %v\n", cYellow, cReset, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		fmt.Fprintf(os.Stderr, "%s[update]%s GitHub API %d\n", cYellow, cReset, resp.StatusCode)
+		return
+	}
+
+	var releases []ghRelease
+	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
+		fmt.Fprintf(os.Stderr, "%s[update]%s parse error: %v\n", cYellow, cReset, err)
+		return
+	}
+	if len(releases) == 0 {
+		return
+	}
+
+	latest := releases[0]
+	if latest.TagName == buildVersion {
+		fmt.Fprintf(os.Stderr, "%s[update]%s already latest (%s)\n", cDim, cReset, buildVersion)
+		return
+	}
+
+	// find matching asset
+	assetName := binaryBaseName + "-" + runtime.GOOS + "-" + runtime.GOARCH
+	if runtime.GOOS == "windows" {
+		assetName += ".exe"
+	}
+
+	var downloadURL string
+	for _, a := range latest.Assets {
+		if a.Name == assetName {
+			downloadURL = a.BrowserDownloadURL
+			break
+		}
+	}
+	if downloadURL == "" {
+		fmt.Fprintf(os.Stderr, "%s[update]%s no binary for %s/%s in %s\n",
+			cYellow, cReset, runtime.GOOS, runtime.GOARCH, latest.TagName)
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "%s[update]%s %s%s%s → %s%s%s  downloading...\n",
+		cCyan, cReset, cDim, buildVersion, cReset, cGreen, latest.TagName, cReset)
+
+	// download with no timeout (binary can be large on slow networks)
+	dlClient := &http.Client{
+		Transport: &http.Transport{Proxy: http.ProxyFromEnvironment},
+	}
+	dlResp, err := dlClient.Get(downloadURL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s[update]%s download failed: %v\n", cYellow, cReset, err)
+		return
+	}
+	defer dlResp.Body.Close()
+
+	if dlResp.StatusCode != 200 {
+		fmt.Fprintf(os.Stderr, "%s[update]%s download HTTP %d\n", cYellow, cReset, dlResp.StatusCode)
+		return
+	}
+
+	// write to temp file in same directory (so rename is atomic)
+	dir := filepath.Dir(exe)
+	tmp, err := os.CreateTemp(dir, ".codex-scanner-update-*")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s[update]%s temp file: %v\n", cYellow, cReset, err)
+		return
+	}
+	tmpPath := tmp.Name()
+
+	if _, err := io.Copy(tmp, dlResp.Body); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		fmt.Fprintf(os.Stderr, "%s[update]%s write failed: %v\n", cYellow, cReset, err)
+		return
+	}
+	tmp.Close()
+
+	// preserve file mode
+	info, err := os.Stat(exe)
+	if err != nil {
+		os.Remove(tmpPath)
+		fmt.Fprintf(os.Stderr, "%s[update]%s stat: %v\n", cYellow, cReset, err)
+		return
+	}
+	if err := os.Chmod(tmpPath, info.Mode()); err != nil {
+		os.Remove(tmpPath)
+		fmt.Fprintf(os.Stderr, "%s[update]%s chmod: %v\n", cYellow, cReset, err)
+		return
+	}
+
+	// atomic replace
+	if err := os.Rename(tmpPath, exe); err != nil {
+		os.Remove(tmpPath)
+		fmt.Fprintf(os.Stderr, "%s[update]%s replace failed: %v\n", cYellow, cReset, err)
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "%s[update]%s updated to %s%s%s, restarting...\n",
+		cGreen, cReset, cBold, latest.TagName, cReset)
+
+	// re-exec self
+	if err := syscall.Exec(exe, os.Args, os.Environ()); err != nil {
+		fmt.Fprintf(os.Stderr, "%s[update]%s restart failed: %v (please re-run manually)\n", cRed, cReset, err)
+	}
+}
+
 // ── CLI flag definitions + main ──────────────────────────────────────────────
 
 func run() int {
@@ -1309,6 +1481,10 @@ func run() int {
 		"Custom webhook headers, format: Key:Value,Key2:Value2")
 	concurrencyFlag := flag.Int("concurrency", 0,
 		"Number of concurrent probe requests (fallback default: 1).")
+	noUpdate := flag.Bool("no-update", false,
+		"Skip automatic OTA update check on startup.")
+	showVersion := flag.Bool("version", false,
+		"Print build version and exit.")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
@@ -1317,6 +1493,12 @@ func run() int {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	// ── --version ──
+	if *showVersion {
+		fmt.Println(buildVersion)
+		return 0
+	}
 
 	// ── track explicitly set flags ──
 	cliSet := map[string]bool{}
@@ -1365,6 +1547,12 @@ func run() int {
 		if cfg.NoProxy == "" {
 			cfg.NoProxy = cfgNoProxy
 		}
+	}
+
+	// ── OTA self-update ──
+	skipUpdate, _ := resolveBool(*noUpdate, cliSet["no-update"], fc, "no_update", false)
+	if !skipUpdate {
+		selfUpdate(cfg.HTTPProxy, cfg.HTTPSProxy, cfg.NoProxy)
 	}
 
 	// numeric fields

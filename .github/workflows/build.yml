@@ -31,6 +31,7 @@ jobs:
       - name: Cross compile
         run: |
           BINARY=codex-scanner
+          VERSION="${{ steps.version.outputs.version }}"
           declare -a TARGETS=(
             "linux/amd64"
             "linux/arm64"
@@ -48,7 +49,9 @@ jobs:
               output="${output}.exe"
             fi
             echo "::group::Building ${GOOS}/${GOARCH}"
-            CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" go build -ldflags="-s -w" -trimpath -o "$output" .
+            CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" go build \
+              -ldflags="-s -w -X main.buildVersion=${VERSION}" \
+              -trimpath -o "$output" .
             echo "::endgroup::"
           done
           ls -lh dist/
