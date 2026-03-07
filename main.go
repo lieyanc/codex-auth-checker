@@ -27,6 +27,7 @@ import (
 
 const (
 	defaultCodexBaseURL = "https://chatgpt.com/backend-api/codex"
+	defaultUsagePath    = "/backend-api/wham/usage"
 	defaultRefreshURL   = "https://auth.openai.com/oauth/token"
 	defaultClientID     = "app_EMoamEEZ73f0CkXaXp7hrann"
 	defaultVersion      = "0.98.0"
@@ -63,6 +64,8 @@ type Config struct {
 	WebhookURL         string
 	WebhookHeaders     string
 	Concurrency        int
+	CheckUsage         bool
+	DisableThreshold   float64
 }
 
 type CheckResult struct {
@@ -75,6 +78,35 @@ type CheckResult struct {
 	Error           string        `json:"error"`
 	ResponsePreview string        `json:"response_preview"`
 	Latency         time.Duration `json:"-"`
+	Usage           *UsageInfo    `json:"usage,omitempty"`
+	Disabled        bool          `json:"disabled,omitempty"`
+}
+
+type UsageWindow struct {
+	UsedPercent     *float64 `json:"used_percent"`
+	LimitWindowSecs *int64   `json:"limit_window_seconds"`
+	ResetAfterSecs  *int64   `json:"reset_after_seconds"`
+	ResetAt         *int64   `json:"reset_at"`
+}
+
+type UsageRateLimit struct {
+	Allowed      *bool        `json:"allowed"`
+	LimitReached *bool        `json:"limit_reached"`
+	PrimaryWin   *UsageWindow `json:"primary_window"`
+	SecondaryWin *UsageWindow `json:"secondary_window"`
+}
+
+type UsagePayload struct {
+	PlanType            string          `json:"plan_type"`
+	RateLimit           *UsageRateLimit `json:"rate_limit"`
+	CodeReviewRateLimit *UsageRateLimit `json:"code_review_rate_limit"`
+}
+
+type UsageInfo struct {
+	PlanType      string   `json:"plan_type,omitempty"`
+	FiveHourUsed  *float64 `json:"five_hour_used_percent,omitempty"`
+	WeeklyUsed    *float64 `json:"weekly_used_percent,omitempty"`
+	WeeklyResetAt *int64   `json:"weekly_reset_at,omitempty"`
 }
 
 type ScanStats struct {
@@ -86,6 +118,7 @@ type ScanStats struct {
 	ProbeDuration  time.Duration `json:"-"`
 	Concurrency    int           `json:"concurrency"`
 	Latencies      []time.Duration `json:"-"`
+	DisabledCount  int           `json:"disabled_count"`
 }
 
 type jsonStats struct {
@@ -120,18 +153,21 @@ type jsonOutput struct {
 	Results  []jsonResult `json:"results"`
 	Stats    *jsonStats   `json:"stats,omitempty"`
 	Deletion jsonDeletion `json:"deletion"`
+	Disable  jsonDisable  `json:"disable"`
 }
 
 type jsonResult struct {
-	File            string  `json:"file"`
-	Provider        string  `json:"provider"`
-	Email           string  `json:"email"`
-	AccountID       string  `json:"account_id"`
-	StatusCode      *int    `json:"status_code"`
-	Unauthorized401 bool    `json:"unauthorized_401"`
-	Error           string  `json:"error"`
-	ResponsePreview string  `json:"response_preview"`
-	LatencyMs       float64 `json:"latency_ms,omitempty"`
+	File            string     `json:"file"`
+	Provider        string     `json:"provider"`
+	Email           string     `json:"email"`
+	AccountID       string     `json:"account_id"`
+	StatusCode      *int       `json:"status_code"`
+	Unauthorized401 bool       `json:"unauthorized_401"`
+	Error           string     `json:"error"`
+	ResponsePreview string     `json:"response_preview"`
+	LatencyMs       float64    `json:"latency_ms,omitempty"`
+	Usage           *UsageInfo `json:"usage,omitempty"`
+	Disabled        bool       `json:"disabled,omitempty"`
 }
 
 type jsonDeletion struct {
@@ -141,6 +177,21 @@ type jsonDeletion struct {
 	DeletedCount int           `json:"deleted_count"`
 	DeletedFiles []string      `json:"deleted_files"`
 	Errors       []DeleteError `json:"errors"`
+}
+
+type DisableError struct {
+	File  string `json:"file"`
+	Error string `json:"error"`
+}
+
+type jsonDisable struct {
+	Requested     bool           `json:"requested"`
+	Threshold     float64        `json:"threshold"`
+	TargetCount   int            `json:"target_count"`
+	Confirmed     bool           `json:"confirmed"`
+	DisabledCount int            `json:"disabled_count"`
+	DisabledFiles []string       `json:"disabled_files"`
+	Errors        []DisableError `json:"errors"`
 }
 
 // ── terminal color / progress helpers ────────────────────────────────────────
@@ -239,7 +290,7 @@ func progressChecking(idx, total int, label string, retry int) {
 	}
 }
 
-func progressResult(idx, total int, label, tag, color string, ls *liveStats) {
+func progressResult(idx, total int, label, tag, color string, usage *UsageInfo, disableThreshold float64, ls *liveStats) {
 	if useColor && ls != nil && ls.footerShown {
 		// erase the footer line, then move up to overwrite the "checking" line
 		emitInline(eraseLine + moveUp + eraseLine)
@@ -247,15 +298,42 @@ func progressResult(idx, total int, label, tag, color string, ls *liveStats) {
 	}
 	b := bar(idx, total, 20)
 	n := num(idx, total)
+
+	usageSuffix := formatUsageSuffix(usage, disableThreshold)
+
 	if useColor {
-		emit(fmt.Sprintf("%s  %s[%s]%s %s[%s]%s  %s%s%s%s  %s",
-			eraseLine, cDim, n, cReset, cCyan, b, cReset, cBold, color, tag, cReset, label))
+		emit(fmt.Sprintf("%s  %s[%s]%s %s[%s]%s  %s%s%s%s  %s%s",
+			eraseLine, cDim, n, cReset, cCyan, b, cReset, cBold, color, tag, cReset, label, usageSuffix))
 	} else {
-		emit(fmt.Sprintf("  [%s] %s  %s", n, tag, label))
+		emit(fmt.Sprintf("  [%s] %s  %s%s", n, tag, label, usageSuffix))
 	}
 	if ls != nil {
 		renderStatsFooter(ls)
 	}
+}
+
+func formatUsageSuffix(usage *UsageInfo, disableThreshold float64) string {
+	if usage == nil {
+		return ""
+	}
+	var parts []string
+	if usage.PlanType != "" {
+		parts = append(parts, fmt.Sprintf("[%s]", usage.PlanType))
+	}
+	if usage.FiveHourUsed != nil {
+		parts = append(parts, fmt.Sprintf("5h:%.0f%%", *usage.FiveHourUsed))
+	}
+	if usage.WeeklyUsed != nil {
+		wk := fmt.Sprintf("wk:%.0f%%", *usage.WeeklyUsed)
+		if disableThreshold > 0 && *usage.WeeklyUsed >= disableThreshold {
+			wk += " ⚠"
+		}
+		parts = append(parts, wk)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "  " + strings.Join(parts, " ")
 }
 
 func renderStatsFooter(ls *liveStats) {
@@ -631,7 +709,7 @@ func probeOneFile(cfg *Config, client *http.Client, path string, fields map[stri
 				preview = preview[:300]
 			}
 			sc := status
-			return CheckResult{
+			result := CheckResult{
 				File:            path,
 				Provider:        fields["provider"],
 				Email:           fields["email"],
@@ -641,6 +719,10 @@ func probeOneFile(cfg *Config, client *http.Client, path string, fields map[stri
 				ResponsePreview: preview,
 				Latency:         time.Since(probeStart),
 			}
+			if cfg.CheckUsage && sc < 400 {
+				result.Usage = fetchUsage(client, accessToken, fields["account_id"])
+			}
+			return result
 		}
 		lastErr = err
 	}
@@ -653,6 +735,40 @@ func probeOneFile(cfg *Config, client *http.Client, path string, fields map[stri
 		Error:     fmt.Sprintf("network error: %v", lastErr),
 		Latency:   time.Since(probeStart),
 	}
+}
+
+func fetchUsage(client *http.Client, accessToken, accountID string) *UsageInfo {
+	usageURL := "https://chatgpt.com" + defaultUsagePath
+	headers := map[string]string{
+		"Authorization": "Bearer " + accessToken,
+		"Content-Type":  "application/json",
+		"User-Agent":    defaultUserAgent,
+	}
+	if accountID != "" {
+		headers["Chatgpt-Account-Id"] = accountID
+	}
+
+	_, respBody, err := httpRequest(client, "GET", usageURL, headers, nil)
+	if err != nil {
+		return nil
+	}
+
+	var payload UsagePayload
+	if err := json.Unmarshal(respBody, &payload); err != nil {
+		return nil
+	}
+
+	info := &UsageInfo{PlanType: payload.PlanType}
+	if payload.RateLimit != nil {
+		if payload.RateLimit.PrimaryWin != nil {
+			info.FiveHourUsed = payload.RateLimit.PrimaryWin.UsedPercent
+		}
+		if payload.RateLimit.SecondaryWin != nil {
+			info.WeeklyUsed = payload.RateLimit.SecondaryWin.UsedPercent
+			info.WeeklyResetAt = payload.RateLimit.SecondaryWin.ResetAt
+		}
+	}
+	return info
 }
 
 // ── file scan main loop ──────────────────────────────────────────────────────
@@ -814,7 +930,7 @@ func scanAuthFiles(ctx context.Context, cfg *Config, client *http.Client) ([]Che
 						ls.latencyMax = result.Latency
 					}
 				}
-				progressResult(done, totalCodex, job.label, tag, color, ls)
+				progressResult(done, totalCodex, job.label, tag, color, result.Usage, cfg.DisableThreshold, ls)
 				mu.Unlock()
 			}
 		}()
@@ -965,18 +1081,29 @@ func printTable(results []CheckResult) {
 					reason = reason[:120]
 				}
 			}
-			fmt.Printf("[%s] %s :: %s\n", status, item.File, reason)
+			usageSuffix := formatUsageSuffix(item.Usage, 0)
+			if item.Disabled {
+				usageSuffix += " [disabled]"
+			}
+			fmt.Printf("[%s] %s%s :: %s\n", status, item.File, usageSuffix, reason)
 		}
 	}
 }
 
 func outputJSON(results []CheckResult, stats ScanStats, requested bool, unauthorizedFiles []string,
-	confirmed bool, deletedFiles []string, deleteErrors []DeleteError, runDir string) {
+	confirmed bool, deletedFiles []string, deleteErrors []DeleteError,
+	disableInfo jsonDisable, runDir string) {
 	if deletedFiles == nil {
 		deletedFiles = []string{}
 	}
 	if deleteErrors == nil {
 		deleteErrors = []DeleteError{}
+	}
+	if disableInfo.DisabledFiles == nil {
+		disableInfo.DisabledFiles = []string{}
+	}
+	if disableInfo.Errors == nil {
+		disableInfo.Errors = []DisableError{}
 	}
 
 	jResults := make([]jsonResult, len(results))
@@ -991,6 +1118,8 @@ func outputJSON(results []CheckResult, stats ScanStats, requested bool, unauthor
 			Error:           r.Error,
 			ResponsePreview: r.ResponsePreview,
 			LatencyMs:       float64(r.Latency.Microseconds()) / 1000.0,
+			Usage:           r.Usage,
+			Disabled:        r.Disabled,
 		}
 	}
 
@@ -1006,6 +1135,7 @@ func outputJSON(results []CheckResult, stats ScanStats, requested bool, unauthor
 			DeletedFiles: deletedFiles,
 			Errors:       deleteErrors,
 		},
+		Disable: disableInfo,
 	}
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
@@ -1164,6 +1294,76 @@ func printDeletionSummary(requested bool, targetCount int, confirmed bool, delet
 	}
 	for _, item := range errors {
 		fmt.Printf("[delete-failed] %s :: %s\n", item.File, item.Error)
+	}
+}
+
+// ── file disable ─────────────────────────────────────────────────────────────
+
+func confirmDisable(targets []string, threshold float64, assumeYes bool) bool {
+	if len(targets) == 0 {
+		return false
+	}
+	if assumeYes {
+		return true
+	}
+	fi, err := os.Stdin.Stat()
+	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+		fmt.Println("No interactive terminal for confirmation; disable cancelled. Use --assume-yes to force.")
+		return false
+	}
+
+	fmt.Println()
+	fmt.Printf("Disable %d file(s) with weekly usage >= %.0f%%? [y/N]: ", len(targets), threshold)
+	reader := bufio.NewReader(os.Stdin)
+	line, _ := reader.ReadString('\n')
+	answer := strings.ToLower(strings.TrimSpace(line))
+	return answer == "y" || answer == "yes"
+}
+
+func disableFiles(paths []string) ([]string, []DisableError) {
+	var disabled []string
+	var errors []DisableError
+	seen := map[string]bool{}
+
+	for _, rawPath := range paths {
+		absPath, err := filepath.Abs(rawPath)
+		if err != nil {
+			absPath = rawPath
+		}
+		if seen[absPath] {
+			continue
+		}
+		seen[absPath] = true
+
+		if strings.HasSuffix(absPath, ".disabled") {
+			continue
+		}
+
+		destPath := absPath + ".disabled"
+		if err := os.Rename(absPath, destPath); err != nil {
+			errors = append(errors, DisableError{File: rawPath, Error: err.Error()})
+		} else {
+			disabled = append(disabled, rawPath)
+		}
+	}
+	return disabled, errors
+}
+
+func printDisableSummary(requested bool, threshold float64, targetCount int, confirmed bool, disabledFiles []string, errors []DisableError) {
+	if !requested || targetCount == 0 {
+		return
+	}
+	fmt.Println()
+	if !confirmed {
+		fmt.Println("Disable cancelled by user.")
+		return
+	}
+	fmt.Printf("Disabled: %d/%d\n", len(disabledFiles), targetCount)
+	for _, p := range disabledFiles {
+		fmt.Printf("[disabled] %s → %s.disabled\n", p, p)
+	}
+	for _, item := range errors {
+		fmt.Printf("[disable-failed] %s :: %s\n", item.File, item.Error)
 	}
 }
 
@@ -1413,11 +1613,47 @@ func runOneScan(ctx context.Context, cfg *Config, client *http.Client) int {
 		}
 	}
 
+	// disable logic: collect files exceeding weekly usage threshold
+	disableInfo := jsonDisable{
+		Requested: cfg.CheckUsage && cfg.DisableThreshold > 0,
+		Threshold: cfg.DisableThreshold,
+	}
+	if disableInfo.Requested {
+		var disableTargets []string
+		var disableTargetIndices []int
+		for i, r := range results {
+			if r.Usage != nil && r.Usage.WeeklyUsed != nil && *r.Usage.WeeklyUsed >= cfg.DisableThreshold {
+				disableTargets = append(disableTargets, r.File)
+				disableTargetIndices = append(disableTargetIndices, i)
+			}
+		}
+		disableInfo.TargetCount = len(disableTargets)
+		if len(disableTargets) > 0 {
+			disableInfo.Confirmed = confirmDisable(disableTargets, cfg.DisableThreshold, cfg.AssumeYes)
+			if disableInfo.Confirmed {
+				disableInfo.DisabledFiles, disableInfo.Errors = disableFiles(disableTargets)
+				disableInfo.DisabledCount = len(disableInfo.DisabledFiles)
+				stats.DisabledCount = disableInfo.DisabledCount
+				// mark disabled results
+				disabledSet := map[string]bool{}
+				for _, f := range disableInfo.DisabledFiles {
+					disabledSet[f] = true
+				}
+				for _, idx := range disableTargetIndices {
+					if disabledSet[results[idx].File] {
+						results[idx].Disabled = true
+					}
+				}
+			}
+		}
+	}
+
 	if cfg.OutputJSON {
-		outputJSON(results, stats, cfg.Delete401, unauthorizedFiles, deleteConfirmed, deletedFiles, deleteErrors, runDir)
+		outputJSON(results, stats, cfg.Delete401, unauthorizedFiles, deleteConfirmed, deletedFiles, deleteErrors, disableInfo, runDir)
 	} else {
 		printTable(results)
 		printDeletionSummary(cfg.Delete401, len(unauthorizedFiles), deleteConfirmed, deletedFiles, deleteErrors, runDir)
+		printDisableSummary(disableInfo.Requested, cfg.DisableThreshold, disableInfo.TargetCount, disableInfo.Confirmed, disableInfo.DisabledFiles, disableInfo.Errors)
 		printStats(stats)
 	}
 
@@ -1806,6 +2042,10 @@ func run() int {
 		"Custom webhook headers, format: Key:Value,Key2:Value2")
 	concurrencyFlag := flag.Int("concurrency", 0,
 		"Number of concurrent probe requests (fallback default: 1).")
+	checkUsage := flag.Bool("check-usage", false,
+		"Query usage/quota after probe for valid tokens.")
+	disableThreshold := flag.Float64("disable-threshold", 0,
+		"Weekly usage % threshold to disable files (0=off, e.g. 80).")
 	noUpdate := flag.Bool("no-update", false,
 		"Skip automatic OTA update check on startup.")
 	showVersion := flag.Bool("version", false,
@@ -1951,6 +2191,17 @@ func run() int {
 	}
 	if cfg.Concurrency < 1 {
 		cfg.Concurrency = 1
+	}
+
+	cfg.CheckUsage, err = resolveBool(*checkUsage, cliSet["check-usage"], fc, "check_usage", false)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: check_usage must be a boolean value\n")
+		return 2
+	}
+	cfg.DisableThreshold, err = resolveFloat64(*disableThreshold, cliSet["disable-threshold"], fc, "disable_threshold", 0)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: disable_threshold must be a number\n")
+		return 2
 	}
 
 	// mutual exclusivity
