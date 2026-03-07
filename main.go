@@ -618,7 +618,7 @@ func buildProbeHeaders(accessToken, accountID string) map[string]string {
 func buildProbeBody(model string) []byte {
 	payload := map[string]interface{}{
 		"model":             model,
-		"stream":            false,
+		"stream":            true,
 		"store":             false,
 		"instructions":      "",
 		"input":             []map[string]string{{"type": "message", "role": "user", "content": "ping"}},
