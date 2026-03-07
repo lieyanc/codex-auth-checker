@@ -2028,6 +2028,98 @@ func selfUpdate(httpProxy, httpsProxy, noProxy string) {
 	}
 }
 
+// ── config auto-create / merge ───────────────────────────────────────────────
+
+func defaultConfig() map[string]interface{} {
+	return map[string]interface{}{
+		"auth_dir":             "",
+		"base_url":             "https://chatgpt.com/backend-api/codex",
+		"quota_path":           "/responses",
+		"model":                "gpt-5",
+		"timeout":              float64(20),
+		"max_retries":          float64(3),
+		"refresh_before_check": false,
+		"refresh_url":          "https://auth.openai.com/oauth/token",
+		"output_json":          false,
+		"output_dir":           "./results",
+		"delete_401":           false,
+		"assume_yes":           false,
+		"proxy": map[string]interface{}{
+			"http":     "",
+			"https":    "",
+			"no_proxy": "localhost,127.0.0.1",
+		},
+		"interval":          "",
+		"cron":              "",
+		"concurrency":       float64(1),
+		"check_usage":       true,
+		"disable_threshold": float64(20),
+		"webhook_url":       "",
+		"webhook_headers":   "",
+		"no_update":         false,
+	}
+}
+
+func writeConfigJSON(path string, cfg map[string]interface{}) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	enc.SetEscapeHTML(false)
+	return enc.Encode(cfg)
+}
+
+// mergeDefaults adds missing keys from defaults into dst (recursive for nested maps).
+// Returns true if any keys were added.
+func mergeDefaults(dst, defaults map[string]interface{}) bool {
+	changed := false
+	for k, dv := range defaults {
+		existing, ok := dst[k]
+		if !ok {
+			dst[k] = dv
+			changed = true
+			continue
+		}
+		// recurse into nested maps
+		if dm, isDMap := dv.(map[string]interface{}); isDMap {
+			if em, isEMap := existing.(map[string]interface{}); isEMap {
+				if mergeDefaults(em, dm) {
+					changed = true
+				}
+			}
+		}
+	}
+	return changed
+}
+
+// ensureConfigFile loads (or creates) the config file and merges missing defaults.
+// Returns the config map, whether this was a first-run creation, and any error.
+func ensureConfigFile(path string) (map[string]interface{}, bool, error) {
+	_, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		cfg := defaultConfig()
+		if wErr := writeConfigJSON(path, cfg); wErr != nil {
+			return nil, false, wErr
+		}
+		return cfg, true, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	// file exists — load and merge
+	fc, loadErr := loadJSON(path)
+	if loadErr != nil {
+		return nil, false, loadErr
+	}
+	if mergeDefaults(fc, defaultConfig()) {
+		_ = writeConfigJSON(path, fc) // best-effort write-back
+	}
+	return fc, false, nil
+}
+
 // ── CLI flag definitions + main ──────────────────────────────────────────────
 
 func run() int {
@@ -2103,15 +2195,34 @@ func run() int {
 		cliSet[f.Name] = true
 	})
 
-	// ── load file config ──
+	// ── load file config (auto-create / merge defaults) ──
 	cfgPath := *configPath
 	fc := map[string]interface{}{}
+	firstRun := false
 	if p := expandHome(cfgPath); p != "" {
-		if loaded, err := loadJSON(p); err == nil {
+		loaded, fr, err := ensureConfigFile(p)
+		if err == nil {
 			fc = loaded
+			firstRun = fr
 		} else if cliSet["config"] {
 			fmt.Fprintf(os.Stderr, "Error: failed to load config file %s: %v\n", p, err)
 			return 2
+		}
+	}
+
+	// ── first-run setup ──
+	if firstRun {
+		fi, statErr := os.Stdin.Stat()
+		if statErr == nil && fi.Mode()&os.ModeCharDevice != 0 {
+			fmt.Fprintf(os.Stderr, "%s首次运行，已创建配置文件: %s%s\n", cGreen, expandHome(cfgPath), cReset)
+			fmt.Fprint(os.Stderr, "请输入 auth 目录路径 (回车跳过): ")
+			reader := bufio.NewReader(os.Stdin)
+			line, _ := reader.ReadString('\n')
+			entered := strings.TrimSpace(line)
+			if entered != "" {
+				fc["auth_dir"] = entered
+				_ = writeConfigJSON(expandHome(cfgPath), fc)
+			}
 		}
 	}
 

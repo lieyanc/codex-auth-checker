@@ -22,5 +22,6 @@
   "check_usage": true,
   "disable_threshold": 20,
   "webhook_url": "",
-  "webhook_headers": ""
+  "webhook_headers": "",
+  "no_update": false
 }
