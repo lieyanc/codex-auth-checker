@@ -1665,8 +1665,29 @@ func runOneScan(ctx context.Context, cfg *Config, client *http.Client) int {
 	return 0
 }
 
+// listenForQuit starts a background goroutine that reads stdin.
+// Typing "q" + Enter cancels the context and force-exits immediately.
+func listenForQuit(cancel context.CancelFunc) {
+	fi, err := os.Stdin.Stat()
+	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+		return // not a TTY, skip
+	}
+	go func() {
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			cmd := strings.TrimSpace(strings.ToLower(scanner.Text()))
+			if cmd == "q" || cmd == "quit" || cmd == "exit" {
+				fmt.Fprintf(os.Stderr, "\n%sForce quit: terminating all tasks...%s\n", cYellow, cReset)
+				cancel()
+				os.Exit(0)
+			}
+		}
+	}()
+}
+
 func runWithInterval(ctx context.Context, cfg *Config, client *http.Client) int {
 	emit(fmt.Sprintf("%sScheduled mode:%s interval=%v", cBold, cReset, cfg.Interval))
+	emit(fmt.Sprintf("%sPress q+Enter to force quit%s", cDim, cReset))
 	emit("")
 
 	runOneScan(ctx, cfg, client)
@@ -1689,6 +1710,7 @@ func runWithInterval(ctx context.Context, cfg *Config, client *http.Client) int 
 
 func runWithCron(ctx context.Context, cfg *Config, client *http.Client, sched *CronSchedule) int {
 	emit(fmt.Sprintf("%sScheduled mode:%s cron=%q", cBold, cReset, cfg.Cron))
+	emit(fmt.Sprintf("%sPress q+Enter to force quit%s", cDim, cReset))
 	emit("")
 
 	for {
@@ -2241,6 +2263,9 @@ func run() int {
 	// ── signal context ──
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	// ── quit listener (q+Enter to force exit) ──
+	listenForQuit(cancel)
 
 	client := buildHTTPClient(cfg.HTTPProxy, cfg.HTTPSProxy, cfg.NoProxy, cfg.Timeout, cfg.Concurrency)
 
