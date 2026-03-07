@@ -155,6 +155,7 @@ var (
 	cDim      string
 	cReset    string
 	eraseLine string
+	moveUp    string
 )
 
 func initColors() {
@@ -171,7 +172,22 @@ func initColors() {
 		cDim = "\033[2m"
 		cReset = "\033[0m"
 		eraseLine = "\033[2K\r"
+		moveUp = "\033[1A"
 	}
+}
+
+// liveStats tracks real-time metrics during the probe phase.
+// All fields must be accessed under the same mutex as the worker loop.
+type liveStats struct {
+	probeStart  time.Time
+	done        int
+	total       int
+	inFlight    int
+	concurrency int
+	latencySum  time.Duration
+	latencyMin  time.Duration
+	latencyMax  time.Duration
+	footerShown bool // whether a footer line is currently on screen
 }
 
 func bar(done, total, width int) string {
@@ -223,7 +239,12 @@ func progressChecking(idx, total int, label string, retry int) {
 	}
 }
 
-func progressResult(idx, total int, label, tag, color string) {
+func progressResult(idx, total int, label, tag, color string, ls *liveStats) {
+	if useColor && ls != nil && ls.footerShown {
+		// erase the footer line, then move up to overwrite the "checking" line
+		emitInline(eraseLine + moveUp + eraseLine)
+		ls.footerShown = false
+	}
 	b := bar(idx, total, 20)
 	n := num(idx, total)
 	if useColor {
@@ -232,6 +253,46 @@ func progressResult(idx, total int, label, tag, color string) {
 	} else {
 		emit(fmt.Sprintf("  [%s] %s  %s", n, tag, label))
 	}
+	if ls != nil {
+		renderStatsFooter(ls)
+	}
+}
+
+func renderStatsFooter(ls *liveStats) {
+	if !useColor {
+		return
+	}
+	elapsed := time.Since(ls.probeStart)
+	pending := ls.total - ls.done - ls.inFlight
+	if pending < 0 {
+		pending = 0
+	}
+
+	avgMs := float64(0)
+	if ls.done > 0 {
+		avgMs = float64(ls.latencySum.Milliseconds()) / float64(ls.done)
+	}
+	throughput := float64(0)
+	if elapsed > 0 && ls.done > 0 {
+		throughput = float64(ls.done) / elapsed.Seconds()
+	}
+
+	parts := []string{
+		fmt.Sprintf("elapsed %s%v%s", cCyan, elapsed.Round(time.Millisecond), cReset),
+		fmt.Sprintf("active %s%d%s/%d", cCyan, ls.inFlight, cReset, ls.concurrency),
+		fmt.Sprintf("pending %s%d%s", cCyan, pending, cReset),
+	}
+	if ls.done > 0 {
+		parts = append(parts,
+			fmt.Sprintf("avg %s%.0fms%s", cCyan, avgMs, cReset),
+			fmt.Sprintf("min %s%.0fms%s", cCyan, float64(ls.latencyMin.Milliseconds()), cReset),
+			fmt.Sprintf("max %s%.0fms%s", cCyan, float64(ls.latencyMax.Milliseconds()), cReset),
+			fmt.Sprintf("%s%.1f req/s%s", cCyan, throughput, cReset),
+		)
+	}
+	line := fmt.Sprintf("  %s⏱ %s%s", cDim, strings.Join(parts, "  "), cReset)
+	emitInline(eraseLine + line)
+	ls.footerShown = true
 }
 
 // ── JSON dot-path utilities ──────────────────────────────────────────────────
@@ -697,6 +758,12 @@ func scanAuthFiles(ctx context.Context, cfg *Config, client *http.Client) ([]Che
 	var mu sync.Mutex
 	done := 0
 
+	ls := &liveStats{
+		probeStart:  probeStart,
+		total:       totalCodex,
+		concurrency: concurrency,
+	}
+
 	jobsCh := make(chan probeJob, len(jobs))
 	var wg sync.WaitGroup
 
@@ -709,10 +776,18 @@ func scanAuthFiles(ctx context.Context, cfg *Config, client *http.Client) ([]Che
 					return
 				}
 
+				mu.Lock()
+				ls.inFlight++
+				mu.Unlock()
+
 				// Show "checking" line only in sequential mode
 				var onRetry retryCallback
 				if !concurrent {
 					mu.Lock()
+					if useColor && ls.footerShown {
+						emitInline(eraseLine + moveUp + eraseLine)
+						ls.footerShown = false
+					}
 					progressChecking(done+1, totalCodex, job.label, 0)
 					mu.Unlock()
 					onRetry = func(retry int) {
@@ -728,7 +803,18 @@ func scanAuthFiles(ctx context.Context, cfg *Config, client *http.Client) ([]Che
 				tag, color := resultTagColor(result, cfg.MaxRetries)
 				mu.Lock()
 				done++
-				progressResult(done, totalCodex, job.label, tag, color)
+				ls.done = done
+				ls.inFlight--
+				if result.Latency > 0 {
+					ls.latencySum += result.Latency
+					if ls.latencyMin == 0 || result.Latency < ls.latencyMin {
+						ls.latencyMin = result.Latency
+					}
+					if result.Latency > ls.latencyMax {
+						ls.latencyMax = result.Latency
+					}
+				}
+				progressResult(done, totalCodex, job.label, tag, color, ls)
 				mu.Unlock()
 			}
 		}()
@@ -743,6 +829,12 @@ func scanAuthFiles(ctx context.Context, cfg *Config, client *http.Client) ([]Che
 	close(jobsCh)
 	wg.Wait()
 	stats.ProbeDuration = time.Since(probeStart)
+
+	// clear the live stats footer
+	if useColor && ls.footerShown {
+		emitInline(eraseLine)
+		emit("")
+	}
 
 	if ctx.Err() != nil {
 		mu.Lock()
@@ -879,7 +971,7 @@ func printTable(results []CheckResult) {
 }
 
 func outputJSON(results []CheckResult, stats ScanStats, requested bool, unauthorizedFiles []string,
-	confirmed bool, deletedFiles []string, deleteErrors []DeleteError, outputDir string) {
+	confirmed bool, deletedFiles []string, deleteErrors []DeleteError, runDir string) {
 	if deletedFiles == nil {
 		deletedFiles = []string{}
 	}
@@ -921,19 +1013,18 @@ func outputJSON(results []CheckResult, stats ScanStats, requested bool, unauthor
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(out)
 
-	if outputDir == "" {
+	if runDir == "" {
 		fmt.Print(buf.String())
 		return
 	}
 
-	dateDir := filepath.Join(outputDir, time.Now().Format("2006-01-02"))
-	if err := os.MkdirAll(dateDir, 0o755); err != nil {
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "%sWarning:%s cannot create output directory %s: %v, printing to stdout\n",
-			cYellow, cReset, dateDir, err)
+			cYellow, cReset, runDir, err)
 		fmt.Print(buf.String())
 		return
 	}
-	outPath := filepath.Join(dateDir, "scan_results.json")
+	outPath := filepath.Join(runDir, "scan_results.json")
 	if err := os.WriteFile(outPath, buf.Bytes(), 0o644); err != nil {
 		fmt.Fprintf(os.Stderr, "%sWarning:%s cannot write %s: %v, printing to stdout\n",
 			cYellow, cReset, outPath, err)
@@ -967,15 +1058,15 @@ func confirmDeletion(targets []string, assumeYes bool) bool {
 	return answer == "y" || answer == "yes"
 }
 
-func deleteFiles(paths []string, outputDir string) ([]string, []DeleteError) {
+func deleteFiles(paths []string, runDir string) ([]string, []DeleteError) {
 	var deleted []string
 	var errors []DeleteError
 	seen := map[string]bool{}
 
 	// determine target directory for archiving deleted files
 	var archiveDir string
-	if outputDir != "" {
-		archiveDir = filepath.Join(outputDir, time.Now().Format("2006-01-02"), "deleted")
+	if runDir != "" {
+		archiveDir = filepath.Join(runDir, "deleted")
 		if err := os.MkdirAll(archiveDir, 0o755); err != nil {
 			emit(fmt.Sprintf("%sWarning:%s cannot create archive directory %s: %v, falling back to permanent deletion",
 				cYellow, cReset, archiveDir, err))
@@ -1048,7 +1139,7 @@ func copyFile(src, dst string) error {
 	return out.Close()
 }
 
-func printDeletionSummary(requested bool, targetCount int, confirmed bool, deletedFiles []string, errors []DeleteError, outputDir string) {
+func printDeletionSummary(requested bool, targetCount int, confirmed bool, deletedFiles []string, errors []DeleteError, runDir string) {
 	if !requested {
 		return
 	}
@@ -1062,8 +1153,8 @@ func printDeletionSummary(requested bool, targetCount int, confirmed bool, delet
 		fmt.Println("Deletion cancelled by user.")
 		return
 	}
-	if outputDir != "" {
-		archiveDir := filepath.Join(outputDir, time.Now().Format("2006-01-02"), "deleted")
+	if runDir != "" {
+		archiveDir := filepath.Join(runDir, "deleted")
 		fmt.Printf("Deletion completed: %d/%d archived to %s\n", len(deletedFiles), targetCount, archiveDir)
 	} else {
 		fmt.Printf("Deletion completed: %d/%d removed.\n", len(deletedFiles), targetCount)
@@ -1298,6 +1389,12 @@ func runOneScan(ctx context.Context, cfg *Config, client *http.Client) int {
 		return 2
 	}
 
+	// build per-run output directory: output_dir/YYYY-MM-DD/HHMMSS
+	runDir := ""
+	if cfg.OutputDir != "" {
+		runDir = filepath.Join(cfg.OutputDir, time.Now().Format("2006-01-02"), time.Now().Format("150405"))
+	}
+
 	var unauthorizedFiles []string
 	for _, r := range results {
 		if r.Unauthorized401 {
@@ -1312,15 +1409,15 @@ func runOneScan(ctx context.Context, cfg *Config, client *http.Client) int {
 	if cfg.Delete401 && len(unauthorizedFiles) > 0 {
 		deleteConfirmed = confirmDeletion(unauthorizedFiles, cfg.AssumeYes)
 		if deleteConfirmed {
-			deletedFiles, deleteErrors = deleteFiles(unauthorizedFiles, cfg.OutputDir)
+			deletedFiles, deleteErrors = deleteFiles(unauthorizedFiles, runDir)
 		}
 	}
 
 	if cfg.OutputJSON {
-		outputJSON(results, stats, cfg.Delete401, unauthorizedFiles, deleteConfirmed, deletedFiles, deleteErrors, cfg.OutputDir)
+		outputJSON(results, stats, cfg.Delete401, unauthorizedFiles, deleteConfirmed, deletedFiles, deleteErrors, runDir)
 	} else {
 		printTable(results)
-		printDeletionSummary(cfg.Delete401, len(unauthorizedFiles), deleteConfirmed, deletedFiles, deleteErrors, cfg.OutputDir)
+		printDeletionSummary(cfg.Delete401, len(unauthorizedFiles), deleteConfirmed, deletedFiles, deleteErrors, runDir)
 		printStats(stats)
 	}
 
