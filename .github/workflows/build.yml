@@ -54,20 +54,11 @@ jobs:
               -trimpath -o "$output" .
             echo "::endgroup::"
           done
+          # version.txt for API-free update checks
+          echo "$VERSION" > dist/version.txt
           ls -lh dist/
 
-      - name: Delete previous dev pre-releases
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release list --json tagName,isPrerelease \
-            -q '.[] | select(.isPrerelease) | select(.tagName | startswith("dev-")) | .tagName' \
-          | while read -r tag; do
-            echo "Deleting release ${tag}..."
-            gh release delete "$tag" --yes --cleanup-tag
-          done
-
-      - name: Create pre-release
+      - name: Recreate static dev release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -76,17 +67,26 @@ jobs:
           FULL_SHA=$(git rev-parse HEAD)
           DATE=$(date -u +%Y-%m-%d)
 
-          gh release create "$VERSION" dist/* \
+          # delete existing dev release + tag (ignore if not found)
+          gh release delete dev --yes --cleanup-tag 2>/dev/null || true
+
+          gh release create dev dist/* \
             --prerelease \
-            --title "Pre-release ${VERSION}" \
+            --title "Dev Build (${VERSION})" \
             --notes "$(cat <<EOF
-          Automated pre-release build
+          Automated dev build — updated on every push to master.
 
           |  |  |
           |--|--|
+          | **Version** | \`${VERSION}\` |
           | **Commit** | \`${FULL_SHA}\` |
           | **Message** | ${COMMIT_MSG} |
           | **Date** | ${DATE} |
+
+          ### Direct download (no API needed)
+          \`\`\`
+          curl -fLO https://github.com/lieyanc/codex-auth-checker/releases/download/dev/codex-scanner-linux-amd64
+          \`\`\`
 
           ### Downloads
           | Platform | Architecture | File |

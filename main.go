@@ -1876,63 +1876,73 @@ func selfUpdate(httpProxy, httpsProxy, noProxy string) {
 		Transport: &http.Transport{Proxy: http.ProxyFromEnvironment},
 	}
 
-	// query latest release (pre-release included)
-	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases?per_page=1", repoOwner, repoName)
-	req, err := http.NewRequest("GET", apiURL, nil)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s[update]%s %v\n", cYellow, cReset, err)
-		return
-	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s[update]%s check failed: %v\n", cYellow, cReset, err)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		fmt.Fprintf(os.Stderr, "%s[update]%s GitHub API %d\n", cYellow, cReset, resp.StatusCode)
-		return
-	}
-
-	var releases []ghRelease
-	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
-		fmt.Fprintf(os.Stderr, "%s[update]%s parse error: %v\n", cYellow, cReset, err)
-		return
-	}
-	if len(releases) == 0 {
-		return
-	}
-
-	latest := releases[0]
-	if latest.TagName == buildVersion {
-		fmt.Fprintf(os.Stderr, "%s[update]%s already latest (%s)\n", cDim, cReset, buildVersion)
-		return
-	}
-
-	// find matching asset
 	assetName := binaryBaseName + "-" + runtime.GOOS + "-" + runtime.GOARCH
 	if runtime.GOOS == "windows" {
 		assetName += ".exe"
 	}
 
-	var downloadURL string
-	for _, a := range latest.Assets {
-		if a.Name == assetName {
-			downloadURL = a.BrowserDownloadURL
-			break
+	devBase := fmt.Sprintf("https://github.com/%s/%s/releases/download/dev", repoOwner, repoName)
+	var remoteVersion, downloadURL string
+
+	// ── primary: GitHub API ──
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases?per_page=1", repoOwner, repoName)
+	if req, err := http.NewRequest("GET", apiURL, nil); err == nil {
+		req.Header.Set("Accept", "application/vnd.github+json")
+		if resp, err := client.Do(req); err == nil {
+			if resp.StatusCode == 200 {
+				var releases []ghRelease
+				if err := json.NewDecoder(resp.Body).Decode(&releases); err == nil && len(releases) > 0 {
+					rel := releases[0]
+					if rel.TagName != "dev" {
+						// proper versioned release: tag IS the version
+						remoteVersion = rel.TagName
+					}
+					for _, a := range rel.Assets {
+						if a.Name == assetName {
+							downloadURL = a.BrowserDownloadURL
+						}
+						if rel.TagName == "dev" && a.Name == "version.txt" {
+							// fetch actual version from version.txt asset
+							if vResp, vErr := client.Get(a.BrowserDownloadURL); vErr == nil {
+								body, _ := io.ReadAll(vResp.Body)
+								vResp.Body.Close()
+								remoteVersion = strings.TrimSpace(string(body))
+							}
+						}
+					}
+				}
+			}
+			resp.Body.Close()
 		}
 	}
+
+	// ── fallback: direct download from static dev tag ──
 	if downloadURL == "" {
-		fmt.Fprintf(os.Stderr, "%s[update]%s no binary for %s/%s in %s\n",
-			cYellow, cReset, runtime.GOOS, runtime.GOARCH, latest.TagName)
+		fmt.Fprintf(os.Stderr, "%s[update]%s API unavailable, trying dev tag...\n", cDim, cReset)
+		if resp, err := client.Get(devBase + "/version.txt"); err == nil {
+			if resp.StatusCode == 200 {
+				body, _ := io.ReadAll(resp.Body)
+				remoteVersion = strings.TrimSpace(string(body))
+				downloadURL = devBase + "/" + assetName
+			}
+			resp.Body.Close()
+		}
+	}
+
+	if downloadURL == "" {
+		fmt.Fprintf(os.Stderr, "%s[update]%s no update source available\n", cYellow, cReset)
 		return
+	}
+	if remoteVersion != "" && remoteVersion == buildVersion {
+		fmt.Fprintf(os.Stderr, "%s[update]%s already latest (%s)\n", cDim, cReset, buildVersion)
+		return
+	}
+	if remoteVersion == "" {
+		remoteVersion = "unknown"
 	}
 
 	fmt.Fprintf(os.Stderr, "%s[update]%s %s%s%s → %s%s%s  downloading...\n",
-		cCyan, cReset, cDim, buildVersion, cReset, cGreen, latest.TagName, cReset)
+		cCyan, cReset, cDim, buildVersion, cReset, cGreen, remoteVersion, cReset)
 
 	// download with no timeout (binary can be large on slow networks)
 	dlClient := &http.Client{
@@ -1988,7 +1998,7 @@ func selfUpdate(httpProxy, httpsProxy, noProxy string) {
 	}
 
 	fmt.Fprintf(os.Stderr, "%s[update]%s updated to %s%s%s, restarting...\n",
-		cGreen, cReset, cBold, latest.TagName, cReset)
+		cGreen, cReset, cBold, remoteVersion, cReset)
 
 	// re-exec self
 	if err := syscall.Exec(exe, os.Args, os.Environ()); err != nil {
