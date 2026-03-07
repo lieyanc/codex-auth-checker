@@ -622,7 +622,6 @@ func buildProbeBody(model string) []byte {
 		"store":             false,
 		"instructions":      "",
 		"input":             []map[string]string{{"type": "message", "role": "user", "content": "ping"}},
-		"max_output_tokens": 1,
 	}
 	body, _ := json.Marshal(payload)
 	return body
