@@ -110,30 +110,32 @@ type UsageInfo struct {
 }
 
 type ScanStats struct {
-	TotalFiles     int           `json:"total_files"`
-	CodexFiles     int           `json:"codex_files"`
-	Unauthorized   int           `json:"unauthorized_401"`
-	Errors         int           `json:"errors"`
-	TotalDuration  time.Duration `json:"-"`
-	ProbeDuration  time.Duration `json:"-"`
-	Concurrency    int           `json:"concurrency"`
-	Latencies      []time.Duration `json:"-"`
-	DisabledCount  int           `json:"disabled_count"`
+	TotalFiles      int             `json:"total_files"`
+	CodexFiles      int             `json:"codex_files"`
+	Unauthorized    int             `json:"unauthorized_401"`
+	Errors          int             `json:"errors"`
+	TotalDuration   time.Duration   `json:"-"`
+	ProbeDuration   time.Duration   `json:"-"`
+	Concurrency     int             `json:"concurrency"`
+	Latencies       []time.Duration `json:"-"`
+	DisabledCount   int             `json:"disabled_count"`
+	StatusCodeDist  map[string]int  `json:"-"`
 }
 
 type jsonStats struct {
-	TotalFiles    int     `json:"total_files"`
-	CodexFiles    int     `json:"codex_files"`
-	Unauthorized  int     `json:"unauthorized_401"`
-	Errors        int     `json:"errors"`
-	Concurrency   int     `json:"concurrency"`
-	TotalDurationMs int64 `json:"total_duration_ms"`
-	ProbeDurationMs int64 `json:"probe_duration_ms"`
-	AvgLatencyMs  float64 `json:"avg_latency_ms"`
-	MinLatencyMs  float64 `json:"min_latency_ms"`
-	MaxLatencyMs  float64 `json:"max_latency_ms"`
-	MedianLatencyMs float64 `json:"median_latency_ms"`
-	P95LatencyMs  float64 `json:"p95_latency_ms"`
+	TotalFiles      int            `json:"total_files"`
+	CodexFiles      int            `json:"codex_files"`
+	Unauthorized    int            `json:"unauthorized_401"`
+	Errors          int            `json:"errors"`
+	Concurrency     int            `json:"concurrency"`
+	TotalDurationMs int64          `json:"total_duration_ms"`
+	ProbeDurationMs int64          `json:"probe_duration_ms"`
+	AvgLatencyMs    float64        `json:"avg_latency_ms"`
+	MinLatencyMs    float64        `json:"min_latency_ms"`
+	MaxLatencyMs    float64        `json:"max_latency_ms"`
+	MedianLatencyMs float64        `json:"median_latency_ms"`
+	P95LatencyMs    float64        `json:"p95_latency_ms"`
+	StatusCodeDist  map[string]int `json:"status_code_distribution,omitempty"`
 }
 
 type DeleteError struct {
@@ -766,6 +768,11 @@ func fetchUsage(client *http.Client, accessToken, accountID string) *UsageInfo {
 		if payload.RateLimit.SecondaryWin != nil {
 			info.WeeklyUsed = payload.RateLimit.SecondaryWin.UsedPercent
 			info.WeeklyResetAt = payload.RateLimit.SecondaryWin.ResetAt
+		} else if payload.RateLimit.PrimaryWin != nil {
+			// Free accounts only have a primary (hourly) window;
+			// store it as WeeklyUsed so disable-threshold logic works.
+			info.WeeklyUsed = payload.RateLimit.PrimaryWin.UsedPercent
+			info.WeeklyResetAt = payload.RateLimit.PrimaryWin.ResetAt
 		}
 	}
 	return info
@@ -960,6 +967,7 @@ func scanAuthFiles(ctx context.Context, cfg *Config, client *http.Client) ([]Che
 
 	// Phase 3: collect results in original file order
 	var results []CheckResult
+	stats.StatusCodeDist = make(map[string]int)
 	for _, s := range slots {
 		if s.valid {
 			results = append(results, s.result)
@@ -971,6 +979,17 @@ func scanAuthFiles(ctx context.Context, cfg *Config, client *http.Client) ([]Che
 			}
 			if s.result.Error != "" {
 				stats.Errors++
+			}
+			// track status code distribution
+			if s.result.StatusCode != nil {
+				key := strconv.Itoa(*s.result.StatusCode)
+				stats.StatusCodeDist[key]++
+			} else if s.result.Error == "missing access token" {
+				stats.StatusCodeDist["no token"]++
+			} else if strings.HasPrefix(s.result.Error, "refresh") {
+				stats.StatusCodeDist["refresh failed"]++
+			} else if s.result.Error != "" {
+				stats.StatusCodeDist["network error"]++
 			}
 		}
 	}
@@ -990,6 +1009,7 @@ func (s ScanStats) computeJSON() jsonStats {
 		Concurrency:     s.Concurrency,
 		TotalDurationMs: s.TotalDuration.Milliseconds(),
 		ProbeDurationMs: s.ProbeDuration.Milliseconds(),
+		StatusCodeDist:  s.StatusCodeDist,
 	}
 	if len(s.Latencies) == 0 {
 		return js
@@ -1037,7 +1057,7 @@ func printStats(stats ScanStats) {
 	}
 }
 
-func printTable(results []CheckResult) {
+func printTable(results []CheckResult, stats ScanStats) {
 	if len(results) == 0 {
 		fmt.Println("No codex auth files found.")
 		return
@@ -1053,6 +1073,46 @@ func printTable(results []CheckResult) {
 	fmt.Printf("Checked codex files: %d\n", len(results))
 	fmt.Printf("401 unauthorized files: %d\n", len(unauthorized))
 	fmt.Println()
+
+	// status code distribution
+	if len(stats.StatusCodeDist) > 0 {
+		emit(fmt.Sprintf("%s── Status Distribution ──%s", cBold, cReset))
+		// sort keys: numeric codes first (ascending), then text labels
+		type kv struct {
+			key   string
+			count int
+		}
+		var entries []kv
+		for k, v := range stats.StatusCodeDist {
+			entries = append(entries, kv{k, v})
+		}
+		sort.Slice(entries, func(i, j int) bool {
+			ni, ei := strconv.Atoi(entries[i].key)
+			nj, ej := strconv.Atoi(entries[j].key)
+			if ei == nil && ej == nil {
+				return ni < nj
+			}
+			if ei == nil {
+				return true
+			}
+			return false
+		})
+		for _, e := range entries {
+			pct := float64(e.count) / float64(len(results)) * 100
+			color := cGreen
+			if code, err := strconv.Atoi(e.key); err == nil {
+				if code == 401 {
+					color = cRed
+				} else if code >= 400 {
+					color = cYellow
+				}
+			} else {
+				color = cYellow
+			}
+			emit(fmt.Sprintf("  %s%-16s%s %s%4d%s  (%5.1f%%)", color, e.key, cReset, cBold, e.count, cReset, pct))
+		}
+		emit("")
+	}
 
 	for _, item := range unauthorized {
 		fmt.Printf("[401] %s\n", item.File)
@@ -1651,7 +1711,7 @@ func runOneScan(ctx context.Context, cfg *Config, client *http.Client) int {
 	if cfg.OutputJSON {
 		outputJSON(results, stats, cfg.Delete401, unauthorizedFiles, deleteConfirmed, deletedFiles, deleteErrors, disableInfo, runDir)
 	} else {
-		printTable(results)
+		printTable(results, stats)
 		printDeletionSummary(cfg.Delete401, len(unauthorizedFiles), deleteConfirmed, deletedFiles, deleteErrors, runDir)
 		printDisableSummary(disableInfo.Requested, cfg.DisableThreshold, disableInfo.TargetCount, disableInfo.Confirmed, disableInfo.DisabledFiles, disableInfo.Errors)
 		printStats(stats)
