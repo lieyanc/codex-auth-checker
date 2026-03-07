@@ -619,6 +619,7 @@ func buildProbeBody(model string) []byte {
 	payload := map[string]interface{}{
 		"model":             model,
 		"stream":            false,
+		"store":             false,
 		"instructions":      "",
 		"input":             []map[string]string{{"type": "message", "role": "user", "content": "ping"}},
 		"max_output_tokens": 1,
@@ -2052,10 +2053,10 @@ func run() int {
 		"Custom webhook headers, format: Key:Value,Key2:Value2")
 	concurrencyFlag := flag.Int("concurrency", 0,
 		"Number of concurrent probe requests (fallback default: 1).")
-	checkUsage := flag.Bool("check-usage", false,
-		"Query usage/quota after probe for valid tokens.")
-	disableThreshold := flag.Float64("disable-threshold", 0,
-		"Weekly usage % threshold to disable files (0=off, e.g. 80).")
+	checkUsage := flag.Bool("check-usage", true,
+		"Query usage/quota after probe for valid tokens (default: true).")
+	disableThreshold := flag.Float64("disable-threshold", 20,
+		"Weekly usage % threshold to disable files (0=off, default: 20).")
 	noUpdate := flag.Bool("no-update", false,
 		"Skip automatic OTA update check on startup.")
 	showVersion := flag.Bool("version", false,
@@ -2203,12 +2204,12 @@ func run() int {
 		cfg.Concurrency = 1
 	}
 
-	cfg.CheckUsage, err = resolveBool(*checkUsage, cliSet["check-usage"], fc, "check_usage", false)
+	cfg.CheckUsage, err = resolveBool(*checkUsage, cliSet["check-usage"], fc, "check_usage", true)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: check_usage must be a boolean value\n")
 		return 2
 	}
-	cfg.DisableThreshold, err = resolveFloat64(*disableThreshold, cliSet["disable-threshold"], fc, "disable_threshold", 0)
+	cfg.DisableThreshold, err = resolveFloat64(*disableThreshold, cliSet["disable-threshold"], fc, "disable_threshold", 20)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: disable_threshold must be a number\n")
 		return 2

@@ -19,8 +19,8 @@
   "interval": "",
   "cron": "",
   "concurrency": 1,
-  "check_usage": false,
-  "disable_threshold": 0,
+  "check_usage": true,
+  "disable_threshold": 20,
   "webhook_url": "",
   "webhook_headers": ""
 }
