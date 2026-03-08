@@ -18,6 +18,8 @@
   },
   "interval": "",
   "cron": "",
+  "refresh_interval": "",
+  "refresh_cron": "",
   "concurrency": 1,
   "check_usage": true,
   "disable_threshold": 20,

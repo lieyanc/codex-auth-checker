@@ -66,6 +66,8 @@ type Config struct {
 	Concurrency        int
 	CheckUsage         bool
 	DisableThreshold   float64
+	RefreshInterval    time.Duration
+	RefreshCron        string
 }
 
 type CheckResult struct {
@@ -389,6 +391,20 @@ func dotGet(data interface{}, dottedKey string) interface{} {
 	return current
 }
 
+func dotSet(data map[string]interface{}, dottedKey string, value interface{}) {
+	parts := strings.Split(dottedKey, ".")
+	cur := data
+	for _, key := range parts[:len(parts)-1] {
+		next, ok := cur[key].(map[string]interface{})
+		if !ok {
+			next = map[string]interface{}{}
+			cur[key] = next
+		}
+		cur = next
+	}
+	cur[parts[len(parts)-1]] = value
+}
+
 func firstNonEmpty(values ...interface{}) string {
 	for _, v := range values {
 		if s, ok := v.(string); ok {
@@ -407,6 +423,15 @@ func pick(data map[string]interface{}, candidates []string) string {
 		vals[i] = dotGet(data, key)
 	}
 	return firstNonEmpty(vals...)
+}
+
+func pickWithKey(data map[string]interface{}, candidates []string) (value, matchedKey string) {
+	for _, key := range candidates {
+		if s, ok := dotGet(data, key).(string); ok && strings.TrimSpace(s) != "" {
+			return strings.TrimSpace(s), key
+		}
+	}
+	return "", ""
 }
 
 // ── Codex file identification ────────────────────────────────────────────────
@@ -446,22 +471,26 @@ func looksLikeCodex(filename string, payload map[string]interface{}) bool {
 // ── auth field extraction ────────────────────────────────────────────────────
 
 func extractAuthFields(payload map[string]interface{}) map[string]string {
+	atVal, atKey := pickWithKey(payload, []string{
+		"access_token", "accessToken",
+		"token.access_token", "token.accessToken",
+		"metadata.access_token", "metadata.accessToken",
+		"metadata.token.access_token", "metadata.token.accessToken",
+		"attributes.api_key",
+	})
+	rtVal, rtKey := pickWithKey(payload, []string{
+		"refresh_token", "refreshToken",
+		"token.refresh_token", "token.refreshToken",
+		"metadata.refresh_token", "metadata.refreshToken",
+		"metadata.token.refresh_token", "metadata.token.refreshToken",
+	})
 	return map[string]string{
-		"provider": firstNonEmpty(pick(payload, []string{"type", "provider", "metadata.type"}), "codex"),
-		"email":    pick(payload, []string{"email", "metadata.email", "attributes.email"}),
-		"access_token": pick(payload, []string{
-			"access_token", "accessToken",
-			"token.access_token", "token.accessToken",
-			"metadata.access_token", "metadata.accessToken",
-			"metadata.token.access_token", "metadata.token.accessToken",
-			"attributes.api_key",
-		}),
-		"refresh_token": pick(payload, []string{
-			"refresh_token", "refreshToken",
-			"token.refresh_token", "token.refreshToken",
-			"metadata.refresh_token", "metadata.refreshToken",
-			"metadata.token.refresh_token", "metadata.token.refreshToken",
-		}),
+		"provider":          firstNonEmpty(pick(payload, []string{"type", "provider", "metadata.type"}), "codex"),
+		"email":             pick(payload, []string{"email", "metadata.email", "attributes.email"}),
+		"access_token":      atVal,
+		"access_token_key":  atKey,
+		"refresh_token":     rtVal,
+		"refresh_token_key": rtKey,
 		"account_id": pick(payload, []string{
 			"account_id", "accountId",
 			"metadata.account_id", "metadata.accountId",
@@ -508,6 +537,35 @@ func stringVal(v interface{}) interface{} {
 	}
 	if s, ok := v.(string); ok {
 		return s
+	}
+	return nil
+}
+
+// ── token write-back ─────────────────────────────────────────────────────────
+
+func writeBackTokens(path, atKey, newAT, rtKey, newRT string) error {
+	data, err := loadJSON(path)
+	if err != nil {
+		return fmt.Errorf("reload %s: %w", path, err)
+	}
+	if atKey != "" && newAT != "" {
+		dotSet(data, atKey, newAT)
+	}
+	if rtKey != "" && newRT != "" {
+		dotSet(data, rtKey, newRT)
+	}
+	buf, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	buf = append(buf, '\n')
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, buf, 0o644); err != nil {
+		return fmt.Errorf("write tmp: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("rename: %w", err)
 	}
 	return nil
 }
@@ -666,7 +724,7 @@ func probeOneFile(cfg *Config, client *http.Client, path string, fields map[stri
 	refreshToken := fields["refresh_token"]
 
 	if cfg.RefreshBeforeCheck && refreshToken != "" {
-		newToken, _, err := refreshAccessToken(client, cfg.RefreshURL, refreshToken)
+		newToken, newRefresh, err := refreshAccessToken(client, cfg.RefreshURL, refreshToken)
 		if err != nil {
 			return CheckResult{
 				File:      path,
@@ -678,6 +736,9 @@ func probeOneFile(cfg *Config, client *http.Client, path string, fields map[stri
 			}
 		}
 		accessToken = newToken
+		if wbErr := writeBackTokens(path, fields["access_token_key"], newToken, fields["refresh_token_key"], newRefresh); wbErr != nil {
+			fmt.Fprintf(os.Stderr, "%sWarning:%s write-back %s: %v\n", cYellow, cReset, filepath.Base(path), wbErr)
+		}
 	}
 
 	if accessToken == "" {
@@ -1641,6 +1702,151 @@ func (cs *CronSchedule) NextAfter(t time.Time) (time.Time, bool) {
 	return time.Time{}, false
 }
 
+// ── batch refresh ────────────────────────────────────────────────────────────
+
+func batchRefreshAll(cfg *Config, client *http.Client) error {
+	authDir, err := filepath.Abs(expandHome(cfg.AuthDir))
+	if err != nil {
+		return fmt.Errorf("cannot resolve auth directory: %w", err)
+	}
+	info, err := os.Stat(authDir)
+	if err != nil || !info.IsDir() {
+		return fmt.Errorf("auth directory not found: %s", authDir)
+	}
+
+	var jsonFiles []string
+	_ = filepath.WalkDir(authDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if !d.IsDir() && strings.HasSuffix(strings.ToLower(d.Name()), ".json") {
+			jsonFiles = append(jsonFiles, path)
+		}
+		return nil
+	})
+
+	type refreshJob struct {
+		path   string
+		fields map[string]string
+	}
+	var jobs []refreshJob
+	for _, path := range jsonFiles {
+		payload, loadErr := loadJSON(path)
+		if loadErr != nil {
+			continue
+		}
+		if !looksLikeCodex(path, payload) {
+			continue
+		}
+		fields := extractAuthFields(payload)
+		if fields["refresh_token"] == "" {
+			continue
+		}
+		jobs = append(jobs, refreshJob{path: path, fields: fields})
+	}
+
+	if len(jobs) == 0 {
+		emit(fmt.Sprintf("%s[refresh]%s no files with refresh_token found", cDim, cReset))
+		return nil
+	}
+
+	concurrency := cfg.Concurrency
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	if concurrency > len(jobs) {
+		concurrency = len(jobs)
+	}
+
+	type refreshResult struct {
+		path   string
+		atKey  string
+		newAT  string
+		rtKey  string
+		newRT  string
+		err    error
+	}
+	results := make([]refreshResult, len(jobs))
+
+	// concurrent refresh
+	jobsCh := make(chan int, len(jobs))
+	var wg sync.WaitGroup
+	for w := 0; w < concurrency; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobsCh {
+				j := jobs[idx]
+				newAT, newRT, err := refreshAccessToken(client, cfg.RefreshURL, j.fields["refresh_token"])
+				results[idx] = refreshResult{
+					path:  j.path,
+					atKey: j.fields["access_token_key"],
+					newAT: newAT,
+					rtKey: j.fields["refresh_token_key"],
+					newRT: newRT,
+					err:   err,
+				}
+			}
+		}()
+	}
+	for i := range jobs {
+		jobsCh <- i
+	}
+	close(jobsCh)
+	wg.Wait()
+
+	// batch write-back: first write all .tmp files, then rename in tight loop
+	var toRename []struct{ tmp, dst string }
+	var refreshed, errCount int
+	for _, r := range results {
+		if r.err != nil {
+			errCount++
+			fmt.Fprintf(os.Stderr, "%s[refresh]%s %s: %v\n", cYellow, cReset, filepath.Base(r.path), r.err)
+			continue
+		}
+		data, loadErr := loadJSON(r.path)
+		if loadErr != nil {
+			errCount++
+			fmt.Fprintf(os.Stderr, "%s[refresh]%s reload %s: %v\n", cYellow, cReset, filepath.Base(r.path), loadErr)
+			continue
+		}
+		if r.atKey != "" && r.newAT != "" {
+			dotSet(data, r.atKey, r.newAT)
+		}
+		if r.rtKey != "" && r.newRT != "" {
+			dotSet(data, r.rtKey, r.newRT)
+		}
+		buf, mErr := json.MarshalIndent(data, "", "  ")
+		if mErr != nil {
+			errCount++
+			continue
+		}
+		buf = append(buf, '\n')
+		tmpPath := r.path + ".tmp"
+		if wErr := os.WriteFile(tmpPath, buf, 0o644); wErr != nil {
+			errCount++
+			fmt.Fprintf(os.Stderr, "%s[refresh]%s write tmp %s: %v\n", cYellow, cReset, filepath.Base(r.path), wErr)
+			continue
+		}
+		toRename = append(toRename, struct{ tmp, dst string }{tmpPath, r.path})
+		refreshed++
+	}
+
+	// tight rename loop — minimal fs watcher churn
+	for _, pair := range toRename {
+		if err := os.Rename(pair.tmp, pair.dst); err != nil {
+			os.Remove(pair.tmp)
+			errCount++
+			refreshed--
+			fmt.Fprintf(os.Stderr, "%s[refresh]%s rename %s: %v\n", cYellow, cReset, filepath.Base(pair.dst), err)
+		}
+	}
+
+	emit(fmt.Sprintf("%s[refresh]%s refreshed %s%d%s/%d  errors %s%d%s",
+		cCyan, cReset, cGreen, refreshed, cReset, len(jobs), cYellow, errCount, cReset))
+	return nil
+}
+
 // ── scheduler ────────────────────────────────────────────────────────────────
 
 func runOneScan(ctx context.Context, cfg *Config, client *http.Client) int {
@@ -1797,6 +2003,53 @@ func runWithCron(ctx context.Context, cfg *Config, client *http.Client, sched *C
 			emit(fmt.Sprintf("\n%s── Scan cycle at %s ──%s",
 				cBold, time.Now().Format("2006-01-02 15:04:05"), cReset))
 			runOneScan(ctx, cfg, client)
+		}
+	}
+}
+
+func runRefreshWithInterval(ctx context.Context, cfg *Config, client *http.Client) {
+	emit(fmt.Sprintf("%sRefresh scheduled:%s interval=%v", cBold, cReset, cfg.RefreshInterval))
+
+	batchRefreshAll(cfg, client)
+
+	ticker := time.NewTicker(cfg.RefreshInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			emit(fmt.Sprintf("\n%s── Refresh cycle at %s ──%s",
+				cBold, time.Now().Format("2006-01-02 15:04:05"), cReset))
+			batchRefreshAll(cfg, client)
+		}
+	}
+}
+
+func runRefreshWithCron(ctx context.Context, cfg *Config, client *http.Client, sched *CronSchedule) {
+	emit(fmt.Sprintf("%sRefresh scheduled:%s cron=%q", cBold, cReset, cfg.RefreshCron))
+
+	for {
+		next, ok := sched.NextAfter(time.Now())
+		if !ok {
+			fmt.Fprintln(os.Stderr, "Error: no next refresh cron trigger within 366 days")
+			return
+		}
+
+		wait := time.Until(next)
+		emit(fmt.Sprintf("Next refresh at %s (in %v)",
+			next.Format("2006-01-02 15:04:05"), wait.Round(time.Second)))
+
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+			emit(fmt.Sprintf("\n%s── Refresh cycle at %s ──%s",
+				cBold, time.Now().Format("2006-01-02 15:04:05"), cReset))
+			batchRefreshAll(cfg, client)
 		}
 	}
 }
@@ -2114,6 +2367,8 @@ func defaultConfig() map[string]interface{} {
 		},
 		"interval":          "",
 		"cron":              "",
+		"refresh_interval":  "",
+		"refresh_cron":      "",
 		"concurrency":       float64(1),
 		"check_usage":       true,
 		"disable_threshold": float64(20),
@@ -2223,6 +2478,10 @@ func run() int {
 		"Scan interval for scheduled mode (e.g. 30m, 1h).")
 	cronExpr := flag.String("cron", "",
 		"Cron expression for scheduled mode (e.g. \"*/30 * * * *\").")
+	refreshInterval := flag.Duration("refresh-interval", 0,
+		"Batch token refresh interval (e.g. 30m, 1h). Mutually exclusive with --refresh-cron.")
+	refreshCron := flag.String("refresh-cron", "",
+		"Cron expression for batch token refresh (e.g. \"0 */6 * * *\").")
 	webhookURL := flag.String("webhook-url", "",
 		"Webhook URL to POST notifications when 401 is found.")
 	webhookHeaders := flag.String("webhook-headers", "",
@@ -2303,6 +2562,7 @@ func run() int {
 	cfg.WebhookURL = resolveStr(*webhookURL, cliSet["webhook-url"], fc, "webhook_url", "")
 	cfg.WebhookHeaders = resolveStr(*webhookHeaders, cliSet["webhook-headers"], fc, "webhook_headers", "")
 	cfg.Cron = resolveStr(*cronExpr, cliSet["cron"], fc, "cron", "")
+	cfg.RefreshCron = resolveStr(*refreshCron, cliSet["refresh-cron"], fc, "refresh_cron", "")
 
 	// proxy: also extract from nested "proxy" object in config
 	if !cliSet["http-proxy"] && cfg.HTTPProxy == "" ||
@@ -2389,6 +2649,22 @@ func run() int {
 		cfg.Interval = *interval
 	}
 
+	// refresh interval from config file
+	if !cliSet["refresh-interval"] {
+		if v := configGet(fc, "refresh_interval"); v != nil {
+			if s, ok := v.(string); ok && s != "" {
+				d, parseErr := time.ParseDuration(s)
+				if parseErr != nil {
+					fmt.Fprintf(os.Stderr, "Error: invalid refresh_interval in config: %v\n", parseErr)
+					return 2
+				}
+				cfg.RefreshInterval = d
+			}
+		}
+	} else {
+		cfg.RefreshInterval = *refreshInterval
+	}
+
 	// concurrency
 	cfg.Concurrency, err = resolveInt(*concurrencyFlag, cliSet["concurrency"], fc, "concurrency", 1)
 	if err != nil {
@@ -2413,6 +2689,10 @@ func run() int {
 	// mutual exclusivity
 	if cfg.Interval > 0 && cfg.Cron != "" {
 		fmt.Fprintln(os.Stderr, "Error: --interval and --cron are mutually exclusive")
+		return 2
+	}
+	if cfg.RefreshInterval > 0 && cfg.RefreshCron != "" {
+		fmt.Fprintln(os.Stderr, "Error: --refresh-interval and --refresh-cron are mutually exclusive")
 		return 2
 	}
 
@@ -2443,11 +2723,35 @@ func run() int {
 
 	client := buildHTTPClient(cfg.HTTPProxy, cfg.HTTPSProxy, cfg.NoProxy, cfg.Timeout, cfg.Concurrency)
 
-	// ── dispatch ──
-	if cfg.Interval > 0 {
-		return runWithInterval(ctx, cfg, client)
+	// ── parse refresh cron early (if set) ──
+	var refreshSched *CronSchedule
+	if cfg.RefreshCron != "" {
+		var cronErr error
+		refreshSched, cronErr = parseCron(cfg.RefreshCron)
+		if cronErr != nil {
+			fmt.Fprintf(os.Stderr, "Error: invalid refresh-cron expression: %v\n", cronErr)
+			return 2
+		}
 	}
-	if cfg.Cron != "" {
+
+	// helper: start batch-refresh goroutine if configured
+	startRefreshBg := func() {
+		if cfg.RefreshInterval > 0 {
+			go runRefreshWithInterval(ctx, cfg, client)
+		} else if refreshSched != nil {
+			go runRefreshWithCron(ctx, cfg, client, refreshSched)
+		}
+	}
+
+	// ── dispatch ──
+	hasRefreshSchedule := cfg.RefreshInterval > 0 || cfg.RefreshCron != ""
+	hasScanSchedule := cfg.Interval > 0 || cfg.Cron != ""
+
+	if hasScanSchedule {
+		startRefreshBg()
+		if cfg.Interval > 0 {
+			return runWithInterval(ctx, cfg, client)
+		}
 		sched, cronErr := parseCron(cfg.Cron)
 		if cronErr != nil {
 			fmt.Fprintf(os.Stderr, "Error: invalid cron expression: %v\n", cronErr)
@@ -2455,6 +2759,15 @@ func run() int {
 		}
 		return runWithCron(ctx, cfg, client, sched)
 	}
+
+	if hasRefreshSchedule {
+		// refresh-only mode: no scan schedule
+		startRefreshBg()
+		<-ctx.Done()
+		emit(fmt.Sprintf("\n%sShutting down gracefully...%s", cYellow, cReset))
+		return 0
+	}
+
 	return runOneScan(ctx, cfg, client)
 }
 
