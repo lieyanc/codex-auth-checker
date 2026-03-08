@@ -2492,6 +2492,8 @@ func run() int {
 		"Query usage/quota after probe for valid tokens (default: true).")
 	disableThreshold := flag.Float64("disable-threshold", 20,
 		"Weekly usage % threshold to disable files (0=off, default: 20).")
+	refreshNow := flag.Bool("refresh-now", false,
+		"Batch-refresh all tokens immediately and exit.")
 	noUpdate := flag.Bool("no-update", false,
 		"Skip automatic OTA update check on startup.")
 	showVersion := flag.Bool("version", false,
@@ -2722,6 +2724,15 @@ func run() int {
 	listenForQuit(cancel)
 
 	client := buildHTTPClient(cfg.HTTPProxy, cfg.HTTPSProxy, cfg.NoProxy, cfg.Timeout, cfg.Concurrency)
+
+	// ── --refresh-now: one-shot batch refresh then exit ──
+	if *refreshNow {
+		if err := batchRefreshAll(cfg, client); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			return 2
+		}
+		return 0
+	}
 
 	// ── parse refresh cron early (if set) ──
 	var refreshSched *CronSchedule
