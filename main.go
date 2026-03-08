@@ -762,15 +762,16 @@ func fetchUsage(client *http.Client, accessToken, accountID string) *UsageInfo {
 
 	info := &UsageInfo{PlanType: payload.PlanType}
 	if payload.RateLimit != nil {
-		if payload.RateLimit.PrimaryWin != nil {
-			info.FiveHourUsed = payload.RateLimit.PrimaryWin.UsedPercent
-		}
 		if payload.RateLimit.SecondaryWin != nil {
+			// Paid accounts: have both windows
+			if payload.RateLimit.PrimaryWin != nil {
+				info.FiveHourUsed = payload.RateLimit.PrimaryWin.UsedPercent
+			}
 			info.WeeklyUsed = payload.RateLimit.SecondaryWin.UsedPercent
 			info.WeeklyResetAt = payload.RateLimit.SecondaryWin.ResetAt
 		} else if payload.RateLimit.PrimaryWin != nil {
-			// Free accounts only have a primary (hourly) window;
-			// store it as WeeklyUsed so disable-threshold logic works.
+			// Free accounts only have a primary window;
+			// store it as WeeklyUsed so disable-threshold and display work.
 			info.WeeklyUsed = payload.RateLimit.PrimaryWin.UsedPercent
 			info.WeeklyResetAt = payload.RateLimit.PrimaryWin.ResetAt
 		}
@@ -1673,7 +1674,7 @@ func runOneScan(ctx context.Context, cfg *Config, client *http.Client) int {
 		}
 	}
 
-	// disable logic: collect files exceeding weekly usage threshold
+	// disable logic: collect files exceeding weekly usage threshold or returning 429
 	disableInfo := jsonDisable{
 		Requested: cfg.CheckUsage && cfg.DisableThreshold > 0,
 		Threshold: cfg.DisableThreshold,
@@ -1682,7 +1683,9 @@ func runOneScan(ctx context.Context, cfg *Config, client *http.Client) int {
 		var disableTargets []string
 		var disableTargetIndices []int
 		for i, r := range results {
-			if r.Usage != nil && r.Usage.WeeklyUsed != nil && *r.Usage.WeeklyUsed >= cfg.DisableThreshold {
+			is429 := r.StatusCode != nil && *r.StatusCode == 429
+			exceedsThreshold := r.Usage != nil && r.Usage.WeeklyUsed != nil && *r.Usage.WeeklyUsed >= cfg.DisableThreshold
+			if is429 || exceedsThreshold {
 				disableTargets = append(disableTargets, r.File)
 				disableTargetIndices = append(disableTargetIndices, i)
 			}
